@@ -155,5 +155,3 @@ fn main() {
     println!("Saved tuned params to params.json");
 }
 
-
-    // NOTE: The block below was added to perturb extended eval parameters too.
