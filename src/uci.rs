@@ -33,6 +33,7 @@ impl Uci {
                     "option name MoveOverhead type spin default 15 min 0 max 5000"
                 )
                 .unwrap();
+                writeln!(out, "option name MultiPV type spin default 1 min 1 max 10").unwrap();
                 writeln!(out, "option name LearnEnable type check default false").unwrap();
                 writeln!(
                     out,
@@ -71,6 +72,10 @@ impl Uci {
                 } else if name.eq_ignore_ascii_case("Threads") {
                     if let Ok(n) = val.trim().parse::<usize>() {
                         self.search.set_threads(n);
+                    }
+                } else if name.eq_ignore_ascii_case("MultiPV") {
+                    if let Ok(n) = val.trim().parse::<usize>() {
+                        self.search.multipv = n.max(1);
                     }
                 } else if name.eq_ignore_ascii_case("ParamsFile") {
                     if !val.trim().is_empty() {
@@ -125,6 +130,10 @@ impl Uci {
                     if let Ok(n) = val.trim().parse::<usize>() {
                         self.search.set_threads(n);
                     }
+                } else if name.eq_ignore_ascii_case("MultiPV") {
+                    if let Ok(n) = val.trim().parse::<usize>() {
+                        self.search.multipv = n.max(1);
+                    }
                 }
             } else if line == "isready" {
                 writeln!(out, "readyok").unwrap();
@@ -153,6 +162,7 @@ impl Uci {
                 let mut winc: u128 = 0;
                 let mut binc: u128 = 0;
                 let mut movestogo: Option<u128> = None;
+                let mut multipv: Option<usize> = None;
 
                 let toks: Vec<&str> = line.split_whitespace().collect();
                 let mut i = 1;
@@ -214,6 +224,14 @@ impl Uci {
                                 i += 1;
                             }
                         }
+                        "multipv" => {
+                            if i + 1 < toks.len() {
+                                multipv = toks[i + 1].parse::<usize>().ok();
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
                         _ => {
                             i += 1;
                         }
@@ -221,7 +239,10 @@ impl Uci {
                 }
 
                 if let Some(d) = depth {
+                    let prev = self.search.multipv;
+                    if let Some(mv) = multipv { self.search.multipv = mv.max(1); }
                     let best = self.search.bestmove(&mut self.board, d);
+                    self.search.multipv = prev;
                     let mv = if best.from == 0 && best.to == 0 {
                         "0000".to_string()
                     } else {
@@ -239,7 +260,10 @@ impl Uci {
                     } else {
                         compute_budget(btime.unwrap_or(1000), binc, movestogo, overhead)
                     };
+                    let prev = self.search.multipv;
+                    if let Some(mv) = multipv { self.search.multipv = mv.max(1); }
                     let best = self.search.bestmove_time(&mut self.board, budget);
+                    self.search.multipv = prev;
                     let mv = if best.from == 0 && best.to == 0 {
                         "0000".to_string()
                     } else {
