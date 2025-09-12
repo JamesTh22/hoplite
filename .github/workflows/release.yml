@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+            ext: ""
+          - os: macos-latest
+            target: macos
+            ext: ""
+          - os: windows-latest
+            target: windows
+            ext: .exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        shell: bash
+        run: |
+          APP=hoplite
+          BIN=target/release/${APP}${{ matrix.ext }}
+          NAME=${APP}-${{ matrix.target }}-x86_64
+          mkdir -p dist/$NAME
+          cp "$BIN" dist/$NAME/
+          # include params and readme if you like
+          [ -f params.json ] && cp params.json dist/$NAME/
+          [ -f README.md ] && cp README.md dist/$NAME/
+          cd dist && zip -r $NAME.zip $NAME
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hoplite-${{ matrix.target }}-x86_64
+          path: dist/hoplite-${{ matrix.target }}-x86_64.zip
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
