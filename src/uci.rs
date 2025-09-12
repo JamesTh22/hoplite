@@ -3,10 +3,12 @@ use crate::search::Search;
 use crate::types::Move;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::Ordering;
 
 pub struct Uci {
     board: Board,
     search: Search,
+    search_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Uci {
@@ -14,6 +16,7 @@ impl Uci {
         Self {
             board: Board::new_start(),
             search: Search::new(),
+            search_thread: None,
         }
     }
 
@@ -154,6 +157,11 @@ impl Uci {
                 let nodes = crate::perft::perft(&mut bclone, depth);
                 writeln!(out, "info string perft({}) = {}", depth, nodes).unwrap();
             } else if line.starts_with("go") {
+                // Stop any previous search
+                if let Some(handle) = self.search_thread.take() {
+                    self.search.stop.store(true, Ordering::Relaxed);
+                    let _ = handle.join();
+                }
                 // Parse time controls
                 let mut depth: Option<i32> = None;
                 let mut movetime: Option<u128> = None;
@@ -163,6 +171,7 @@ impl Uci {
                 let mut binc: u128 = 0;
                 let mut movestogo: Option<u128> = None;
                 let mut multipv: Option<usize> = None;
+                let mut infinite = false;
 
                 let toks: Vec<&str> = line.split_whitespace().collect();
                 let mut i = 1;
@@ -232,15 +241,36 @@ impl Uci {
                                 i += 1;
                             }
                         }
+                        "infinite" => {
+                            infinite = true;
+                            i += 1;
+                        }
                         _ => {
                             i += 1;
                         }
                     }
                 }
-
-                if let Some(d) = depth {
+                if infinite {
+                    self.search.stop.store(false, Ordering::Relaxed);
+                    let mut s = self.search.clone();
+                    if let Some(mv) = multipv {
+                        s.multipv = mv.max(1);
+                    }
+                    let mut b = self.board.clone();
+                    self.search_thread = Some(std::thread::spawn(move || {
+                        let best = s.bestmove_infinite(&mut b);
+                        let mv = if best.from == 0 && best.to == 0 {
+                            "0000".to_string()
+                        } else {
+                            best.uci()
+                        };
+                        println!("bestmove {}", mv);
+                    }));
+                } else if let Some(d) = depth {
                     let prev = self.search.multipv;
-                    if let Some(mv) = multipv { self.search.multipv = mv.max(1); }
+                    if let Some(mv) = multipv {
+                        self.search.multipv = mv.max(1);
+                    }
                     let best = self.search.bestmove(&mut self.board, d);
                     self.search.multipv = prev;
                     let mv = if best.from == 0 && best.to == 0 {
@@ -261,7 +291,9 @@ impl Uci {
                         compute_budget(btime.unwrap_or(1000), binc, movestogo, overhead)
                     };
                     let prev = self.search.multipv;
-                    if let Some(mv) = multipv { self.search.multipv = mv.max(1); }
+                    if let Some(mv) = multipv {
+                        self.search.multipv = mv.max(1);
+                    }
                     let best = self.search.bestmove_time(&mut self.board, budget);
                     self.search.multipv = prev;
                     let mv = if best.from == 0 && best.to == 0 {
@@ -272,7 +304,16 @@ impl Uci {
                     writeln!(out, "bestmove {}", mv).unwrap();
                 }
             } else if line == "quit" {
+                self.search.stop.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.search_thread.take() {
+                    let _ = handle.join();
+                }
                 break;
+            } else if line == "stop" {
+                self.search.stop.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.search_thread.take() {
+                    let _ = handle.join();
+                }
             }
         }
     }

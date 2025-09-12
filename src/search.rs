@@ -7,7 +7,10 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 const MAX_PLY: usize = 128;
@@ -47,7 +50,7 @@ pub struct Search {
     pub move_overhead_ms: u64,
     pub nodes: u64,
     pub tt: Arc<Mutex<TT>>,
-    pub stop: bool,
+    pub stop: Arc<AtomicBool>,
     pub threads: usize,
     pub deadline: Option<Instant>,
 
@@ -64,7 +67,7 @@ impl Search {
         Self {
             nodes: 0,
             tt: Arc::new(Mutex::new(TT::new(64))),
-            stop: false,
+            stop: Arc::new(AtomicBool::new(false)),
             threads: 1,
             deadline: None,
             pawn_tt: HashMap::with_capacity(1 << 16),
@@ -125,7 +128,7 @@ impl Search {
     pub fn bestmove(&mut self, b: &mut Board, depth: i32) -> Move {
         let mut history_keys: Vec<u64> = vec![b.key];
         self.nodes = 0;
-        self.stop = false;
+        self.stop.store(false, Ordering::Relaxed);
         self.deadline = None;
         let mut best = Move::default();
         let mut last_score: i16 = 0;
@@ -165,7 +168,7 @@ impl Search {
                 );
             }
             let _ = io::stdout().flush();
-            if self.stop {
+            if self.stop.load(Ordering::Relaxed) {
                 break;
             }
         }
@@ -176,7 +179,7 @@ impl Search {
     pub fn bestmove_time(&mut self, b: &mut Board, time_ms: u128) -> Move {
         let mut history_keys: Vec<u64> = vec![b.key];
         self.nodes = 0;
-        self.stop = false;
+        self.stop.store(false, Ordering::Relaxed);
         self.deadline = Some(Instant::now() + Duration::from_millis(time_ms as u64));
         let mut best = Move::default();
         let mut last_score: i16 = 0;
@@ -217,7 +220,7 @@ impl Search {
             }
             let _ = io::stdout().flush();
             if self.time_up() {
-                self.stop = true;
+                self.stop.store(true, Ordering::Relaxed);
                 break;
             }
         }
@@ -225,6 +228,57 @@ impl Search {
             let now = Instant::now();
             if now < deadline {
                 std::thread::sleep(deadline - now);
+            }
+        }
+        best
+    }
+
+    // Infinite search until stop flag is set
+    pub fn bestmove_infinite(&mut self, b: &mut Board) -> Move {
+        let mut history_keys: Vec<u64> = vec![b.key];
+        self.nodes = 0;
+        self.stop.store(false, Ordering::Relaxed);
+        self.deadline = None;
+        let mut best = Move::default();
+        let mut last_score: i16 = 0;
+        let start = Instant::now();
+
+        for d in 1..=64 {
+            let pvs = self.search_root(b, d, &mut history_keys, last_score, self.multipv);
+            if pvs.is_empty() {
+                break;
+            }
+            last_score = pvs[0].1;
+            best = pvs[0].0[0];
+            let elapsed = start.elapsed().as_millis();
+            if self.multipv > 1 {
+                for (idx, (pv, sc)) in pvs.iter().enumerate() {
+                    let pv_str = pv.iter().map(|m| m.uci()).collect::<Vec<_>>().join(" ");
+                    println!(
+                        "info depth {} multipv {} score cp {} time {} nodes {} pv {}",
+                        d,
+                        idx + 1,
+                        sc,
+                        elapsed,
+                        self.nodes,
+                        pv_str
+                    );
+                }
+            } else {
+                let pv_str = pvs[0]
+                    .0
+                    .iter()
+                    .map(|m| m.uci())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "info depth {} score cp {} time {} nodes {} pv {}",
+                    d, pvs[0].1, elapsed, self.nodes, pv_str
+                );
+            }
+            let _ = io::stdout().flush();
+            if self.stop.load(Ordering::Relaxed) {
+                break;
             }
         }
         best
@@ -290,7 +344,7 @@ impl Search {
                 results.into_iter().map(|(m, s, _)| (m, s)).collect();
             results.sort_by_key(|(_, s)| -*s);
             if self.time_up() {
-                self.stop = true;
+                self.stop.store(true, Ordering::Relaxed);
             }
             let mut pvs = Vec::new();
             for (mv, sc) in results.iter().take(multipv) {
@@ -313,7 +367,7 @@ impl Search {
             results.clear();
             for (_, mv) in scored.clone() {
                 if self.time_up() {
-                    self.stop = true;
+                    self.stop.store(true, Ordering::Relaxed);
                     break;
                 }
                 let u = b.make_move(mv);
@@ -383,7 +437,7 @@ impl Search {
     ) -> i16 {
         self.nodes += 1;
         if (self.nodes & 0x1FFF) == 0 && self.time_up() {
-            self.stop = true;
+            self.stop.store(true, Ordering::Relaxed);
             return alpha;
         }
         if is_draw(history_keys, b.key, b.halfmove) {
@@ -545,7 +599,7 @@ impl Search {
     ) -> i16 {
         self.nodes += 1;
         if (self.nodes & 0x1FFF) == 0 && self.time_up() {
-            self.stop = true;
+            self.stop.store(true, Ordering::Relaxed);
             return alpha;
         }
         if is_draw(history_keys, b.key, b.halfmove) {
