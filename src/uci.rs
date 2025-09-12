@@ -1,7 +1,6 @@
 use crate::board::Board;
 use crate::search::Search;
 use crate::types::Move;
-use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
 pub struct Uci {
@@ -89,12 +88,7 @@ impl Uci {
                     }
                 } else if name.eq_ignore_ascii_case("LearnFile") {
                     if !val.trim().is_empty() {
-                        self.search.exp_path = Some(val.trim().to_string());
-                        if let Ok(s) = std::fs::read_to_string(val.trim()) {
-                            let map: HashMap<u128, (u32, u32)> =
-                                serde_json::from_str(&s).unwrap_or_default();
-                            self.search.exp_table = map;
-                        }
+                        self.search.load_experience(val.trim());
                     }
                 }
             } else if line == "saveparams" {

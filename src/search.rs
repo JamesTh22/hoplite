@@ -41,8 +41,6 @@ pub struct Search {
     pub exp_enabled: bool,
     pub exp_strength: i32, // 0..100
     pub exp_path: Option<String>,
-
-    pub pawn_tt: HashMap<u64, i32>,
     pub move_overhead_ms: u64,
     pub nodes: u64,
     pub tt: Arc<Mutex<TT>>,
@@ -63,7 +61,6 @@ impl Search {
             stop: false,
             threads: 1,
             deadline: None,
-            pawn_tt: HashMap::with_capacity(1 << 16),
             exp_table: HashMap::with_capacity(1 << 14),
             exp_enabled: false,
             exp_strength: 40,
@@ -72,6 +69,14 @@ impl Search {
             killers: [[Move::default(); 2]; MAX_PLY],
             history: [[0; 4096]; 2],
         }
+    }
+    pub fn load_experience(&mut self, path: &str) {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if let Ok(map) = serde_json::from_str::<HashMap<u128, (u32, u32)>>(&s) {
+                self.exp_table = map;
+            }
+        }
+        self.exp_path = Some(path.to_string());
     }
     pub fn set_hash_mb(&mut self, mb: usize) {
         *self.tt.lock() = TT::new(mb);
