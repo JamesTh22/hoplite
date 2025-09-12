@@ -201,14 +201,94 @@ impl Search {
     }
 
     // Time-limited
+    // Dynamic time management based on position complexity and game phase
+    fn allocate_time(&self, total_time_ms: u128, b: &Board) -> u128 {
+        // Count material to estimate game phase (0-256)
+        let mut phase = 0;
+        let mut total_pieces = 0;
+        for i in 0..64u8 {
+            if let Some(pc) = b.piece_at(i) {
+                total_pieces += 1;
+                match pc.kind {
+                    PieceKind::Pawn => phase += 0,
+                    PieceKind::Knight | PieceKind::Bishop => phase += 8,
+                    PieceKind::Rook => phase += 16,
+                    PieceKind::Queen => phase += 32,
+                    PieceKind::King => phase += 0,
+                }
+            }
+        }
+        phase = phase.min(256);
+
+        // Estimate position complexity (0-100)
+        let mut complexity = 0;
+        
+        // More pieces = more complex
+        complexity += (total_pieces * 2).min(30);
+        
+        // Check for tactical elements
+        let moves = legal_moves(b);
+        for mv in moves.iter() {
+            if b.piece_at(mv.to).is_some() { // Captures available
+                complexity += 5;
+            }
+            let u = b.make_move(*mv);
+            if b.in_check(b.stm) { // Checks available
+                complexity += 10;
+            }
+            b.unmake_move(*mv, u);
+        }
+        
+        // Kings under attack need more time
+        if square_attacked(b, king_square(b, b.stm), b.stm.flip()) {
+            complexity += 20;
+        }
+        
+        complexity = complexity.min(100);
+
+        // Adjust time based on phase and complexity
+        let mut allocated = total_time_ms;
+        
+        // Use more time in complex middlegame positions
+        if phase > 64 && phase < 192 {
+            allocated = allocated * (100 + complexity as u128) / 100;
+        }
+        
+        // Use less time in simple endgames
+        if phase <= 64 {
+            allocated = allocated * 70 / 100;
+        }
+        
+        // Ensure reasonable bounds
+        allocated = allocated.clamp(total_time_ms/10, total_time_ms*2);
+        
+        allocated
+    }
+    
+    fn king_square(b: &Board, side: Side) -> u8 {
+        for i in 0..64u8 {
+            if let Some(pc) = b.piece_at(i) {
+                if pc.side == side && matches!(pc.kind, PieceKind::King) {
+                    return i;
+                }
+            }
+        }
+        32 // Default to center if not found (shouldn't happen)
+    }
+
     pub fn bestmove_time(&mut self, b: &mut Board, time_ms: u128) -> Move {
         let mut history_keys: Vec<u64> = vec![b.key];
         self.nodes = 0;
         self.stop.store(false, Ordering::Relaxed);
-        self.deadline = Some(Instant::now() + Duration::from_millis(time_ms as u64));
+        
+        // Get dynamically allocated time based on position
+        let allocated_time = self.allocate_time(time_ms, b);
+        self.deadline = Some(Instant::now() + Duration::from_millis(allocated_time as u64));
+        
         let mut best = Move::default();
         let mut last_score: i16 = 0;
         let mut stable_count = 0; // Track stability
+        let mut prev_nodes = 0; // Track node count for progress assessment
         let start = Instant::now();
 
         for d in 1..=64 {
@@ -513,25 +593,60 @@ impl Search {
             return 0;
         }
 
+        let in_check = b.in_check(b.stm);
+
+        // Static eval pruning
         if depth <= 0 {
             return self.qsearch(b, alpha, beta, history_keys);
         }
 
-        // Transposition table
-        {
-            let tt = self.tt.lock();
-            if let Some(e) = tt.probe(b.key) {
-                match e.bound {
-                    Bound::Exact => return e.value,
-                    Bound::Lower => {
-                        if e.value > alpha {
-                            alpha = e.value;
-                        }
+        // Eval pruning / futility pruning
+        if !in_check && depth <= 3 {
+            let eval = eval(b);
+            
+            // Reverse futility pruning
+            if depth <= 3 && eval >= beta + futility_margin(depth) {
+                return eval;
+            }
+            
+            // Futility pruning
+            if depth <= 2 {
+                let margin = futility_margin(depth);
+                if eval + margin <= alpha {
+                    let qscore = self.qsearch(b, alpha, beta, history_keys);
+                    if qscore <= alpha {
+                        return qscore;
                     }
-                    Bound::Upper => {
-                        if e.value < beta {
-                            return e.value;
-                        }
+                }
+            }
+        }
+
+        // Transposition table lookup
+        let tt_entry = {
+            let tt = self.tt.lock();
+            tt.probe(b.key)
+        };
+        
+        // Internal Iterative Deepening when we have no TT move
+        if depth >= 4 && !tt_entry.is_some() {
+            let iid_depth = depth - 2;
+            self.alphabeta(b, iid_depth, alpha, beta, ply, false, history_keys);
+            let tt = self.tt.lock();
+            tt_entry = tt.probe(b.key);
+        }
+        
+        // Use TT entry if we found one
+        if let Some(e) = tt_entry {
+            match e.bound {
+                Bound::Exact => return e.value,
+                Bound::Lower => {
+                    if e.value > alpha {
+                        alpha = e.value;
+                    }
+                }
+                Bound::Upper => {
+                    if e.value < beta {
+                        return e.value;
                     }
                 }
             }
@@ -588,16 +703,58 @@ impl Search {
             if gave_check {
                 new_depth += 1;
             }
-            if depth >= 3 && !is_capture && !gave_check && idx >= 3 {
+            // Enhanced Late Move Reductions (LMR)
+            if depth >= 3 && !is_capture && !gave_check {
                 let d = depth as i32;
                 let m = (idx as i32) + 1;
-                let mut r = 1 + ((d / 3) + (m / 6));
-                if r > d - 1 {
-                    r = d - 1;
+                
+                // Dynamic base reduction
+                let mut r = if idx >= 3 {
+                    // More aggressive reduction for later moves
+                    let base = ((d / 2) + (m / 3)) as f32;
+                    // Scale reduction based on move history
+                    let side_idx = if b.stm == Side::White { 0 } else { 1 };
+                    let hist_idx = (mv.from as usize) * 64 + (mv.to as usize);
+                    let hist_score = self.history[side_idx][hist_idx] as f32;
+                    let scale = 1.0 - (hist_score / 16000.0).min(0.7); // Cap history impact
+                    (base * scale).round() as i32 + 1
+                } else {
+                    // Light reduction for early moves
+                    1 + (d / 4)
+                };
+                
+                // Adjust based on move characteristics
+                if let Some(p) = b.piece_at(mv.from) {
+                    match p.kind {
+                        PieceKind::Knight | PieceKind::Bishop if idx < 8 => {
+                            // Less reduction for developing moves early
+                            r = r.saturating_sub(1);
+                        }
+                        PieceKind::Pawn => {
+                            // Less reduction for pawn moves to 6th/7th rank
+                            let to_rank = mv.to / 8;
+                            if (p.side == Side::White && to_rank >= 5) ||
+                               (p.side == Side::Black && to_rank <= 2) {
+                                r = r.saturating_sub(1);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                if r > 0 {
-                    new_depth -= r;
+                
+                // History-based adjustments
+                let side_idx = if b.stm == Side::White { 0 } else { 1 };
+                let hist_idx = (mv.from as usize) * 64 + (mv.to as usize);
+                if self.history[side_idx][hist_idx] > 8000 {
+                    r = r.saturating_sub(1);
                 }
+                
+                // Clamp reduction
+                r = r.clamp(1, d - 1);
+                new_depth -= r;
+                
+                // Ensure minimum search depth
+                new_depth = new_depth.max(1);
             }
 
             history_keys.push(b.key);
@@ -679,6 +836,13 @@ impl Search {
         if stand_pat >= beta {
             return beta;
         }
+        
+        // Delta pruning - don't look for captures if we're too far behind
+        const DELTA_MARGIN: i16 = 900; // Queen value
+        if stand_pat + DELTA_MARGIN < alpha {
+            return alpha;
+        }
+        
         if stand_pat > alpha {
             alpha = stand_pat;
         }
@@ -686,14 +850,34 @@ impl Search {
         let moves = legal_moves(b);
         let mut captures: Vec<(i32, Move)> = Vec::new();
         let mut checks: Vec<Move> = Vec::new();
+        let mut dangerous_moves: Vec<Move> = Vec::new(); // For potential threats
+        
         for mv in moves {
             if b.piece_at(mv.to).is_some() {
-                captures.push((score_capture(b, mv), mv));
+                let see_score = see(b, mv.from, mv.to);
+                if see_score >= 0 { // Only consider positive or equal captures
+                    captures.push((score_capture(b, mv) + see_score as i32, mv));
+                }
             } else {
                 let u = b.make_move(mv);
+                
+                // Check for discovered attacks on king or valuable pieces
                 if b.in_check(b.stm) {
                     checks.push(mv);
+                } else {
+                    // Look for moves that attack valuable pieces
+                    for sq in 0..64u8 {
+                        if let Some(pc) = b.piece_at(sq) {
+                            if pc.side == b.stm && matches!(pc.kind, PieceKind::Queen | PieceKind::Rook) {
+                                if square_attacked(b, sq, b.stm.flip()) {
+                                    dangerous_moves.push(mv);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
+                
                 b.unmake_move(mv, u);
             }
         }
@@ -741,34 +925,130 @@ impl Search {
         tt_move: Option<Move>,
     ) -> Vec<(i32, Move)> {
         let mut v: Vec<(i32, Move)> = Vec::with_capacity(moves.len());
-        for &mv in moves {
-            let mut s: i32 = 0;
-            if let Some(tmv) = tt_move {
-                if tmv.from == mv.from && tmv.to == mv.to && tmv.promo == mv.promo {
-                    s += 1_000_000;
+        // Pre-calculate king and queen positions for move targeting bonus
+        let mut king_sqs = [None::<u8>; 2];
+        let mut queen_sqs = [Vec::new(); 2];
+        for i in 0..64u8 {
+            if let Some(pc) = b.piece_at(i) {
+                let side_idx = if pc.side == Side::White { 0 } else { 1 };
+                match pc.kind {
+                    PieceKind::King => king_sqs[side_idx] = Some(i),
+                    PieceKind::Queen => queen_sqs[side_idx].push(i),
+                    _ => {}
                 }
             }
-            if b.piece_at(mv.to).is_some() {
-                if see(b, mv.from, mv.to) < 0 {
-                    continue;
+        }
+        
+        for &mv in moves {
+            let mut s: i32 = 0;
+            
+            // TT move gets highest priority
+            if let Some(tmv) = tt_move {
+                if tmv.from == mv.from && tmv.to == mv.to && tmv.promo == mv.promo {
+                    s += 2_000_000; // Higher bonus for TT moves
                 }
-                s += score_capture(b, mv);
+            }
+            
+            let side_idx = if b.stm == Side::White { 0 } else { 1 };
+            
+            // Captures scored by MVV/LVA
+            if let Some(victim) = b.piece_at(mv.to) {
+                if see(b, mv.from, mv.to) >= 0 {
+                    let see_score = see(b, mv.from, mv.to);
+                    s += 1_000_000 + see_score + score_capture(b, mv);
+                    
+                    // Bonus for capturing with lesser pieces
+                    if let Some(attacker) = b.piece_at(mv.from) {
+                        if piece_value(attacker.kind) < piece_value(victim.kind) {
+                            s += 5000;
+                        }
+                    }
+                } else {
+                    s -= 1_000_000; // Heavily penalize losing captures
+                }
             } else {
-                let side_idx = if b.stm == Side::White { 0 } else { 1 };
-                // killers
+                // Enhanced scoring for non-captures
+                let u = b.make_move(mv);
+                
+                // Check detection with bonus scaling
+                if b.in_check(b.stm) {
+                    s += 500_000; // Base bonus for checks
+                    
+                    // Additional bonus for discovered checks
+                    let from_pc = b.piece_at(mv.from);
+                    if from_pc.map_or(false, |p| !matches!(p.kind, PieceKind::Queen | PieceKind::Rook | PieceKind::Bishop)) {
+                        s += 100_000; // Extra bonus for discovered checks
+                    }
+                }
+
+                // Threat detection
+                let enemy_side = b.stm;
+                if let Some(enemy_king) = king_sqs[enemy_side as usize] {
+                    // Distance to enemy king (closer moves get bonus)
+                    let file_dist = (file_of(mv.to) as i32 - file_of(enemy_king) as i32).abs();
+                    let rank_dist = (rank_of(mv.to) as i32 - rank_of(enemy_king) as i32).abs();
+                    let king_dist = file_dist.max(rank_dist);
+                    s += (8 - king_dist) * 2000;
+                }
+                
+                // Control of critical squares
+                let is_central = (mv.to % 8 >= 2 && mv.to % 8 <= 5) && (mv.to / 8 >= 2 && mv.to / 8 <= 5);
+                if is_central {
+                    s += 3000;
+                }
+                
+                b.unmake_move(mv, u);
+                
+                // Killers get good bonus but below good captures
                 if self.killers[ply][0].from == mv.from && self.killers[ply][0].to == mv.to {
-                    s += 12_000;
+                    s += 100_000;
                 }
                 if self.killers[ply][1].from == mv.from && self.killers[ply][1].to == mv.to {
-                    s += 8_000;
+                    s += 80_000;
                 }
-                // history
+                
+                // History score
                 let idx = (mv.from as usize) * 64 + (mv.to as usize);
                 s += self.history[side_idx][idx];
+                
+                // Positional bonuses
+                if let Some(p) = b.piece_at(mv.from) {
+                    match p.kind {
+                        PieceKind::Pawn => {
+                            // Bonus for pawn advances
+                            let to_rank = mv.to / 8;
+                            if p.side == Side::White {
+                                s += (to_rank as i32) * 1000;
+                            } else {
+                                s += (7 - to_rank as i32) * 1000;
+                            }
+                        }
+                        PieceKind::Knight | PieceKind::Bishop => {
+                            // Development bonus in opening
+                            if ply < 20 {
+                                s += 2000;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             v.push((s, mv));
         }
         v
+    }
+
+fn piece_value(kind: PieceKind) -> i32 {
+    use PieceKind::*;
+    match kind {
+        Pawn => 100,
+        Knight => 320,
+        Bishop => 330,
+        Rook => 500,
+        Queen => 900,
+        King => 10000,
+    }
+}
     }
 }
 
@@ -802,17 +1082,19 @@ fn score_capture(b: &Board, mv: Move) -> i32 {
     val(victim.kind) - val(attacker.kind) / 10
 }
 
-// Simple SEE and helpers
+// Static Exchange Evaluation
 fn see(b: &Board, from: u8, to: u8) -> i32 {
     use crate::types::PieceKind::*;
     let val = |k: crate::types::PieceKind| -> i32 {
+        // More precise SEE values - slightly lower than actual piece values
+        // to avoid overvaluing captures
         match k {
-            Pawn => 100,
-            Knight => 320,
-            Bishop => 330,
-            Rook => 500,
-            Queen => 900,
-            King => 10_000,
+            Pawn => 95,    // Conservative pawn value
+            Knight => 310,  // Knights slightly undervalued in SEE
+            Bishop => 320,  // Bishops slightly undervalued in SEE
+            Rook => 475,    // Rooks undervalued to prevent bad rook trades
+            Queen => 875,   // Queens slightly undervalued to prevent bad queen trades
+            King => 9900,   // High but not infinite to detect king captures
         }
     };
     let mut occ = b.pieces;
@@ -1287,7 +1569,11 @@ fn eval(b: &Board) -> i16 {
 
     // Blend middlegame and endgame scores
     let denom = (p.mg_weight as i32 + p.eg_weight as i32).max(1);
-    let blended = (mg * p.mg_weight as i32 + eg * p.eg_weight as i32) / denom;
+    let mut blended = (mg * p.mg_weight as i32 + eg * p.eg_weight as i32) / denom;
+
+    // Apply endgame-specific scoring adjustments
+    let endgame_adjustment = crate::endgame::get_endgame_score_adjustment(b);
+    blended += endgame_adjustment as i32;
 
     let out = if b.stm == Side::White {
         blended
@@ -1306,3 +1592,17 @@ fn file_of(sq: u8) -> usize {
 fn rank_of(sq: u8) -> usize {
     (sq as usize) >> 3
 }
+
+// Futility margins for different depths
+#[inline]
+fn futility_margin(depth: i32) -> i16 {
+    let base = match depth {
+        1 => 125,  // Slightly higher than pawn value
+        2 => 350,  // Higher than minor piece
+        3 => 550,  // Higher than rook value
+        _ => 0,
+    };
+    
+    // Scale margin up in late game positions
+    let phase_bonus = if depth > 1 { depth as i16 * 25 } else { 0 };
+    base + phase_bonus

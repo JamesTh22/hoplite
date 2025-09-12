@@ -1,6 +1,7 @@
 use crate::board::Board;
 use crate::types::{sq, Move, PieceKind, Side};
 
+mod movecache;
 use lazy_static::lazy_static;
 
 const ROOK_DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
@@ -156,19 +157,59 @@ fn add(moves: &mut Vec<Move>, from: u8, to: u8) {
 }
 
 pub fn legal_moves(b: &Board) -> Vec<Move> {
+    // Check cache first
+    if let Some(cached) = super::movecache::get_cached_legal_moves(b.key) {
+        return cached;
+    }
+
     let mut ms = Vec::with_capacity(64);
     pseudo_legal(b, &mut ms);
-    // filter illegal (leaves king in check)
+    
+    // Filter illegal moves (leaves king in check)
     let mut legal = Vec::with_capacity(ms.len());
+    let my_king = find_king(b, b.stm);
+    
     for m in ms.into_iter() {
         let mut bb = b.clone();
         let u = bb.make_move(m);
-        if !bb.in_check(b.stm) {
-            legal.push(m);
+        
+        // Quick check for direct king moves
+        let is_king_move = match b.piece_at(m.from) {
+            Some(p) => p.kind == PieceKind::King,
+            None => false
+        };
+        
+        // If king move, check if target square is attacked
+        if is_king_move {
+            if !square_attacked(&bb, m.to, b.stm.flip()) {
+                legal.push(m);
+            }
+        } else {
+            // For non-king moves, check if our king is in check
+            if let Some(king_sq) = my_king {
+                if !square_attacked(&bb, king_sq, b.stm.flip()) {
+                    legal.push(m);
+                }
+            }
         }
         bb.unmake_move(m, u);
     }
+
+    // Cache the results
+    super::movecache::store_legal_moves(b.key, legal.clone());
     legal
+}
+
+// Helper function to find king square
+fn find_king(b: &Board, side: Side) -> Option<u8> {
+    for s in 0..64u8 {
+        if let Some(p) = b.piece_at(s) {
+            if p.side == side && p.kind == PieceKind::King {
+                return Some(s);
+            }
+        }
+    }
+    None
 }
 
 pub fn pseudo_legal(b: &Board, out: &mut Vec<Move>) {
@@ -367,7 +408,31 @@ pub fn square_attacked(b: &Board, s: u8, by: Side) -> bool {
     let f = (s % 8) as i32;
     let r = (s / 8) as i32;
     let occ = b.occupancy();
-    // pawn attacks
+    
+    // Check sliding piece attacks first (most common attackers)
+    let rook_queen_attacks = rook_attacks(occ, s);
+    let bishop_queen_attacks = bishop_attacks(occ, s);
+    
+    // Check all attackers in one pass
+    for bb in [rook_queen_attacks, bishop_queen_attacks] {
+        let mut attacks = bb;
+        while attacks != 0 {
+            let t = attacks.trailing_zeros() as u8;
+            attacks &= attacks - 1;
+            if let Some(p) = b.piece_at(t) {
+                if p.side == by {
+                    match p.kind {
+                        PieceKind::Queen => return true,
+                        PieceKind::Rook if bb == rook_queen_attacks => return true,
+                        PieceKind::Bishop if bb == bishop_queen_attacks => return true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    
+    // Pawn attacks (fast check using precomputed targets)
     let dir = if by == Side::White { -1 } else { 1 };
     for df in [-1, 1] {
         if let Some(t) = sq(f + df, r + dir) {
@@ -378,49 +443,30 @@ pub fn square_attacked(b: &Board, s: u8, by: Side) -> bool {
             }
         }
     }
-    // knight
-    let mut nbb = KNIGHT_TARGETS[s as usize];
-    while nbb != 0 {
-        let t = nbb.trailing_zeros() as u8;
-        nbb &= nbb - 1;
+    
+    // Knight attacks (using bitboard)
+    let mut knights = KNIGHT_TARGETS[s as usize];
+    while knights != 0 {
+        let t = knights.trailing_zeros() as u8;
+        knights &= knights - 1;
         if let Some(p) = b.piece_at(t) {
             if p.side == by && matches!(p.kind, PieceKind::Knight) {
                 return true;
             }
         }
     }
-    // king
-    let mut kbb = KING_TARGETS[s as usize];
-    while kbb != 0 {
-        let t = kbb.trailing_zeros() as u8;
-        kbb &= kbb - 1;
+    
+    // King attacks (last because least likely)
+    let mut kings = KING_TARGETS[s as usize];
+    while kings != 0 {
+        let t = kings.trailing_zeros() as u8;
+        kings &= kings - 1;
         if let Some(p) = b.piece_at(t) {
             if p.side == by && matches!(p.kind, PieceKind::King) {
                 return true;
             }
         }
     }
-    // rook/queen sliders
-    let mut rbb = rook_attacks(occ, s);
-    while rbb != 0 {
-        let t = rbb.trailing_zeros() as u8;
-        rbb &= rbb - 1;
-        if let Some(p) = b.piece_at(t) {
-            if p.side == by && matches!(p.kind, PieceKind::Rook | PieceKind::Queen) {
-                return true;
-            }
-        }
-    }
-    // bishop/queen sliders
-    let mut bbb = bishop_attacks(occ, s);
-    while bbb != 0 {
-        let t = bbb.trailing_zeros() as u8;
-        bbb &= bbb - 1;
-        if let Some(p) = b.piece_at(t) {
-            if p.side == by && matches!(p.kind, PieceKind::Bishop | PieceKind::Queen) {
-                return true;
-            }
-        }
-    }
+    
     false
 }
