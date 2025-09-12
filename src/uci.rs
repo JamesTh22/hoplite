@@ -3,10 +3,13 @@ use crate::search::Search;
 use crate::types::Move;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::Ordering;
+use std::thread::{self, JoinHandle};
 
 pub struct Uci {
     board: Board,
     search: Search,
+    search_thread: Option<JoinHandle<Move>>,
 }
 
 impl Uci {
@@ -14,6 +17,7 @@ impl Uci {
         Self {
             board: Board::new_start(),
             search: Search::new(),
+            search_thread: None,
         }
     }
 
@@ -145,6 +149,12 @@ impl Uci {
                 let nodes = crate::perft::perft(&mut bclone, depth);
                 writeln!(out, "info string perft({}) = {}", depth, nodes).unwrap();
             } else if line.starts_with("go") {
+                // If a background search is running, stop it
+                if let Some(handle) = self.search_thread.take() {
+                    self.search.stop.store(true, Ordering::Relaxed);
+                    let _ = handle.join();
+                }
+
                 // Parse time controls
                 let mut depth: Option<i32> = None;
                 let mut movetime: Option<u128> = None;
@@ -153,6 +163,7 @@ impl Uci {
                 let mut winc: u128 = 0;
                 let mut binc: u128 = 0;
                 let mut movestogo: Option<u128> = None;
+                let mut infinite = false;
 
                 let toks: Vec<&str> = line.split_whitespace().collect();
                 let mut i = 1;
@@ -214,13 +225,22 @@ impl Uci {
                                 i += 1;
                             }
                         }
+                        "infinite" => {
+                            infinite = true;
+                            i += 1;
+                        }
                         _ => {
                             i += 1;
                         }
                     }
                 }
 
-                if let Some(d) = depth {
+                if infinite {
+                    let mut s = self.search.clone();
+                    let mut b = self.board.clone();
+                    self.search.stop.store(false, Ordering::Relaxed);
+                    self.search_thread = Some(thread::spawn(move || s.bestmove_infinite(&mut b)));
+                } else if let Some(d) = depth {
                     let best = self.search.bestmove(&mut self.board, d);
                     let mv = if best.from == 0 && best.to == 0 {
                         "0000".to_string()
@@ -247,7 +267,23 @@ impl Uci {
                     };
                     writeln!(out, "bestmove {}", mv).unwrap();
                 }
+            } else if line == "stop" {
+                self.search.stop.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.search_thread.take() {
+                    if let Ok(best) = handle.join() {
+                        let mv = if best.from == 0 && best.to == 0 {
+                            "0000".to_string()
+                        } else {
+                            best.uci()
+                        };
+                        writeln!(out, "bestmove {}", mv).unwrap();
+                    }
+                }
             } else if line == "quit" {
+                self.search.stop.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.search_thread.take() {
+                    let _ = handle.join();
+                }
                 break;
             }
         }
