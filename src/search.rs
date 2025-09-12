@@ -51,6 +51,9 @@ pub struct Search {
     pub threads: usize,
     pub deadline: Option<Instant>,
 
+    // Multi-PV
+    pub multipv: usize,
+
     // Move ordering
     pub killers: [[Move; 2]; MAX_PLY], // two killer moves per ply
     pub history: [[i32; 4096]; 2],     // side, from*64+to
@@ -70,6 +73,7 @@ impl Search {
             exp_strength: 40,
             exp_path: None,
             move_overhead_ms: 15,
+            multipv: 1,
             killers: [[Move::default(); 2]; MAX_PLY],
             history: [[0; 4096]; 2],
         }
@@ -94,6 +98,29 @@ impl Search {
         }
     }
 
+    fn get_pv(&self, b: &mut Board, max_depth: usize) -> Vec<Move> {
+        let mut pv = Vec::new();
+        for _ in 0..max_depth {
+            let mv = {
+                let tt = self.tt.lock();
+                tt.probe(b.key).map(|e| e.best).unwrap_or_default()
+            };
+            if mv.from == 0 && mv.to == 0 {
+                break;
+            }
+            let legal = legal_moves(b);
+            if !legal
+                .iter()
+                .any(|m| m.from == mv.from && m.to == mv.to && m.promo == mv.promo)
+            {
+                break;
+            }
+            let _u = b.make_move(mv);
+            pv.push(mv);
+        }
+        pv
+    }
+
     // Depth-limited
     pub fn bestmove(&mut self, b: &mut Board, depth: i32) -> Move {
         let mut history_keys: Vec<u64> = vec![b.key];
@@ -105,20 +132,38 @@ impl Search {
         let start = Instant::now();
 
         for d in 1..=depth {
-            let (m, sc) = self.search_root(b, d, &mut history_keys, last_score);
-            last_score = sc;
-            if m.from != 0 || m.to != 0 {
-                best = m;
+            let pvs = self.search_root(b, d, &mut history_keys, last_score, self.multipv);
+            if pvs.is_empty() {
+                break;
             }
+            last_score = pvs[0].1;
+            best = pvs[0].0[0];
             let elapsed = start.elapsed().as_millis();
-            println!(
-                "info depth {} score cp {} time {} nodes {} pv {}",
-                d,
-                sc,
-                elapsed,
-                self.nodes,
-                best.uci()
-            );
+            if self.multipv > 1 {
+                for (idx, (pv, sc)) in pvs.iter().enumerate() {
+                    let pv_str = pv.iter().map(|m| m.uci()).collect::<Vec<_>>().join(" ");
+                    println!(
+                        "info depth {} multipv {} score cp {} time {} nodes {} pv {}",
+                        d,
+                        idx + 1,
+                        sc,
+                        elapsed,
+                        self.nodes,
+                        pv_str
+                    );
+                }
+            } else {
+                let pv_str = pvs[0]
+                    .0
+                    .iter()
+                    .map(|m| m.uci())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "info depth {} score cp {} time {} nodes {} pv {}",
+                    d, pvs[0].1, elapsed, self.nodes, pv_str
+                );
+            }
             let _ = io::stdout().flush();
             if self.stop {
                 break;
@@ -138,20 +183,38 @@ impl Search {
         let start = Instant::now();
 
         for d in 1..=64 {
-            let (m, sc) = self.search_root(b, d, &mut history_keys, last_score);
-            last_score = sc;
-            if m.from != 0 || m.to != 0 {
-                best = m;
+            let pvs = self.search_root(b, d, &mut history_keys, last_score, self.multipv);
+            if pvs.is_empty() {
+                break;
             }
+            last_score = pvs[0].1;
+            best = pvs[0].0[0];
             let elapsed = start.elapsed().as_millis();
-            println!(
-                "info depth {} score cp {} time {} nodes {} pv {}",
-                d,
-                sc,
-                elapsed,
-                self.nodes,
-                best.uci()
-            );
+            if self.multipv > 1 {
+                for (idx, (pv, sc)) in pvs.iter().enumerate() {
+                    let pv_str = pv.iter().map(|m| m.uci()).collect::<Vec<_>>().join(" ");
+                    println!(
+                        "info depth {} multipv {} score cp {} time {} nodes {} pv {}",
+                        d,
+                        idx + 1,
+                        sc,
+                        elapsed,
+                        self.nodes,
+                        pv_str
+                    );
+                }
+            } else {
+                let pv_str = pvs[0]
+                    .0
+                    .iter()
+                    .map(|m| m.uci())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "info depth {} score cp {} time {} nodes {} pv {}",
+                    d, pvs[0].1, elapsed, self.nodes, pv_str
+                );
+            }
             let _ = io::stdout().flush();
             if self.time_up() {
                 self.stop = true;
@@ -173,10 +236,11 @@ impl Search {
         depth: i32,
         history_keys: &mut Vec<u64>,
         prev_score: i16,
-    ) -> (Move, i16) {
+        multipv: usize,
+    ) -> Vec<(Vec<Move>, i16)> {
         let moves = legal_moves(b);
         if moves.is_empty() {
-            return (Move::default(), 0);
+            return Vec::new();
         }
 
         let mut scored = self.score_moves(b, &moves, 0, None);
@@ -222,23 +286,31 @@ impl Search {
                 })
                 .collect();
             self.nodes += results.iter().map(|(_, _, n)| *n).sum::<u64>();
-            if let Some((mv, sc, _)) = results.into_iter().max_by_key(|(_, sc, _)| *sc) {
-                if self.time_up() {
-                    self.stop = true;
-                }
-                return (mv, sc);
-            } else {
-                return (Move::default(), 0);
+            let mut results: Vec<(Move, i16)> =
+                results.into_iter().map(|(m, s, _)| (m, s)).collect();
+            results.sort_by_key(|(_, s)| -*s);
+            if self.time_up() {
+                self.stop = true;
             }
+            let mut pvs = Vec::new();
+            for (mv, sc) in results.iter().take(multipv) {
+                let mut bb = b.clone();
+                let _ = bb.make_move(*mv);
+                let mut pv = vec![*mv];
+                pv.extend(self.get_pv(&mut bb, depth.max(0) as usize));
+                pvs.push((pv, *sc));
+            }
+            return pvs;
         }
 
-        let mut best = Move::default();
         let mut alpha = prev_score.saturating_sub(50);
         let mut beta = prev_score.saturating_add(50);
         let (orig_a, orig_b) = (alpha, beta);
 
+        let mut results: Vec<(Move, i16)> = Vec::new();
         let mut widened_low = false;
         'asp: loop {
+            results.clear();
             for (_, mv) in scored.clone() {
                 if self.time_up() {
                     self.stop = true;
@@ -267,9 +339,9 @@ impl Search {
                 }
                 let sc = -self.alphabeta(b, new_depth, -beta, -alpha, 1, false, history_keys);
                 b.unmake_move(mv, u);
+                results.push((mv, sc));
                 if sc > alpha {
                     alpha = sc;
-                    best = mv;
                 }
             }
 
@@ -286,7 +358,17 @@ impl Search {
             }
             break;
         }
-        (best, alpha)
+
+        results.sort_by_key(|(_, s)| -*s);
+        let mut pvs = Vec::new();
+        for (mv, sc) in results.iter().take(multipv) {
+            let mut bb = b.clone();
+            let _ = bb.make_move(*mv);
+            let mut pv = vec![*mv];
+            pv.extend(self.get_pv(&mut bb, depth.max(0) as usize));
+            pvs.push((pv, *sc));
+        }
+        pvs
     }
 
     fn alphabeta(
@@ -369,6 +451,8 @@ impl Search {
         }
 
         let mut value = i16::MIN / 2;
+        let mut best_move = Move::default();
+        let orig_alpha = alpha;
         // Order moves
         let mut scored = self.score_moves(b, &moves, ply, None);
         scored.sort_by_key(|(s, _)| -*s);
@@ -410,10 +494,21 @@ impl Search {
                         self.killers[ply][0] = mv;
                     }
                 }
+                {
+                    let mut tt = self.tt.lock();
+                    tt.store(Entry {
+                        key: b.key,
+                        depth: (depth as i8),
+                        value: beta,
+                        bound: Bound::Lower,
+                        best: mv,
+                    });
+                }
                 return beta;
             }
             if sc > value {
                 value = sc;
+                best_move = mv;
             }
             if sc > alpha {
                 alpha = sc;
@@ -421,7 +516,7 @@ impl Search {
         }
 
         // Store in TT
-        let bound = if value <= alpha {
+        let bound = if value <= orig_alpha {
             Bound::Upper
         } else if value >= beta {
             Bound::Lower
@@ -435,7 +530,7 @@ impl Search {
                 depth: (depth as i8),
                 value,
                 bound,
-                best: Move::default(),
+                best: best_move,
             });
         }
         value
