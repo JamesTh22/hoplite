@@ -1,14 +1,14 @@
 use crate::board::Board;
-use crate::movegen::legal_moves;
+use crate::movegen::{legal_moves, square_attacked};
 use crate::params::PARAMS;
 use crate::tt::{Bound, Entry, TT};
 use crate::types::{Move, PieceKind, Side};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::io::{self, Write};
 
 const MAX_PLY: usize = 128;
 #[inline]
@@ -726,15 +726,15 @@ fn ray_clear(
 fn eval(b: &Board) -> i16 {
     // PSTs from White's perspective
     const PAWN: [i16; 64] = [
-        0, 5, 5, -5, -5, 5, 5, 0, 0, 10, -5, 0, 0, -5, 10, 0, 0, 10, 10, 20, 20, 10, 10, 0, 5,
-        10, 20, 35, 35, 20, 10, 5, 10, 20, 30, 40, 40, 30, 20, 10, 15, 25, 35, 45, 45, 35, 25,
-        15, 20, 30, 30, 0, 0, 30, 30, 20, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 5, 5, -5, -5, 5, 5, 0, 0, 10, -5, 0, 0, -5, 10, 0, 0, 10, 10, 20, 20, 10, 10, 0, 5, 10,
+        20, 35, 35, 20, 10, 5, 10, 20, 30, 40, 40, 30, 20, 10, 15, 25, 35, 45, 45, 35, 25, 15, 20,
+        30, 30, 0, 0, 30, 30, 20, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
     const KNIGHT: [i16; 64] = [
         -50, -30, -10, -10, -10, -10, -30, -50, -30, -5, 5, 10, 10, 5, -5, -30, -10, 10, 15, 20,
         20, 15, 10, -10, -10, 5, 20, 25, 25, 20, 5, -10, -10, 5, 20, 25, 25, 20, 5, -10, -10, 10,
-        15, 20, 20, 15, 10, -10, -30, -5, 5, 10, 10, 5, -5, -30, -50, -30, -10, -10, -10, -10,
-        -30, -50,
+        15, 20, 20, 15, 10, -10, -30, -5, 5, 10, 10, 5, -5, -30, -50, -30, -10, -10, -10, -10, -30,
+        -50,
     ];
     const BISHOP: [i16; 64] = [
         -20, -10, -10, -10, -10, -10, -10, -20, -10, 5, 0, 5, 5, 0, 5, -10, -10, 10, 10, 15, 15,
@@ -744,8 +744,8 @@ fn eval(b: &Board) -> i16 {
     ];
     const ROOK: [i16; 64] = [
         0, 0, 5, 10, 10, 5, 0, 0, 0, 0, 5, 10, 10, 5, 0, 0, 0, 0, 5, 10, 10, 5, 0, 0, 5, 10, 10,
-        15, 15, 10, 10, 5, 5, 10, 10, 15, 15, 10, 10, 5, 0, 0, 5, 10, 10, 5, 0, 0, 0, 0, 5, 10,
-        10, 5, 0, 0, 0, 0, 5, 10, 10, 5, 0, 0,
+        15, 15, 10, 10, 5, 5, 10, 10, 15, 15, 10, 10, 5, 0, 0, 5, 10, 10, 5, 0, 0, 0, 0, 5, 10, 10,
+        5, 0, 0, 0, 0, 5, 10, 10, 5, 0, 0,
     ];
     const QUEEN: [i16; 64] = [
         -20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5, 0,
@@ -763,10 +763,12 @@ fn eval(b: &Board) -> i16 {
     let pv = p.piece_val;
 
     // Material + PST
-    let mut s: i32 = 0;
+    let mut mg: i32 = 0;
+    let mut eg: i32 = 0;
     let mut bishops = [0u8; 2];
     let mut pawns_by_file = [[0u8; 8]; 2];
     let mut king_sq = [None::<u8>; 2];
+    let mut passed_pawns: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
     for i in 0..64u8 {
         if let Some(pc) = b.piece_at(i) {
             let side_idx = if matches!(pc.side, Side::White) { 0 } else { 1 };
@@ -805,16 +807,24 @@ fn eval(b: &Board) -> i16 {
                 PieceKind::King => pv[5] as i32,
             };
             let term = (val as i16 + pst_scaled) as i32;
-            s += if pc.side == Side::White { term } else { -term };
+            if pc.side == Side::White {
+                mg += term;
+                eg += term;
+            } else {
+                mg -= term;
+                eg -= term;
+            }
         }
     }
 
     // Bishop pair
     if bishops[0] >= 2 {
-        s += p.bishop_pair as i32;
+        mg += p.bishop_pair as i32;
+        eg += p.bishop_pair as i32;
     }
     if bishops[1] >= 2 {
-        s -= p.bishop_pair as i32;
+        mg -= p.bishop_pair as i32;
+        eg -= p.bishop_pair as i32;
     }
 
     // Rook on open / semi-open files
@@ -826,17 +836,23 @@ fn eval(b: &Board) -> i16 {
                 let friendly_pawns = pawns_by_file[side_idx][f];
                 let enemy_pawns = pawns_by_file[1 - side_idx][f];
                 if friendly_pawns == 0 && enemy_pawns == 0 {
-                    s += if side_idx == 0 {
-                        p.rook_open_file as i32
+                    let bonus = p.rook_open_file as i32;
+                    if side_idx == 0 {
+                        mg += bonus;
+                        eg += bonus;
                     } else {
-                        -(p.rook_open_file as i32)
-                    };
+                        mg -= bonus;
+                        eg -= bonus;
+                    }
                 } else if friendly_pawns == 0 && enemy_pawns > 0 {
-                    s += if side_idx == 0 {
-                        p.rook_semi_open_file as i32
+                    let bonus = p.rook_semi_open_file as i32;
+                    if side_idx == 0 {
+                        mg += bonus;
+                        eg += bonus;
                     } else {
-                        -(p.rook_semi_open_file as i32)
-                    };
+                        mg -= bonus;
+                        eg -= bonus;
+                    }
                 }
             }
         }
@@ -849,7 +865,9 @@ fn eval(b: &Board) -> i16 {
         for f in 0..8 {
             if pawns_by_file[side_idx][f] > 1 {
                 let extra = (pawns_by_file[side_idx][f] - 1) as i32;
-                s += sign * extra * (p.doubled_pawn as i32);
+                let penalty = sign * extra * (p.doubled_pawn as i32);
+                mg += penalty;
+                eg += penalty;
             }
         }
         // isolated & passed per pawn
@@ -873,7 +891,9 @@ fn eval(b: &Board) -> i16 {
                             0
                         };
                         if left == 0 && right == 0 {
-                            s += sign * (p.isolated_pawn as i32);
+                            let pen = sign * (p.isolated_pawn as i32);
+                            mg += pen;
+                            eg += pen;
                         }
 
                         // passed: scan enemy pawns
@@ -908,7 +928,10 @@ fn eval(b: &Board) -> i16 {
                         if !enemy_block {
                             let rel_rank = if side_idx == 0 { r } else { 7 - r };
                             let idx = rel_rank.clamp(0, 7) as usize;
-                            s += sign * (p.passed_pawn[idx] as i32);
+                            let bonus = sign * (p.passed_pawn[idx] as i32);
+                            mg += bonus;
+                            eg += bonus;
+                            passed_pawns[side_idx].push(i);
                         }
                     }
                 }
@@ -916,7 +939,43 @@ fn eval(b: &Board) -> i16 {
         }
     }
 
-    // King pawn shield (front three squares one rank ahead)
+    // Connected passers & rook behind passer (endgame features)
+    for side_idx in 0..2 {
+        let sign = if side_idx == 0 { 1 } else { -1 };
+        let passers = &passed_pawns[side_idx];
+        for (i, &sq1) in passers.iter().enumerate() {
+            for &sq2 in passers.iter().skip(i + 1) {
+                if (file_of(sq1) as i32 - file_of(sq2) as i32).abs() == 1
+                    && rank_of(sq1) == rank_of(sq2)
+                {
+                    eg += sign * (p.connected_passers as i32);
+                }
+            }
+        }
+        for &sq in passers.iter() {
+            let f = file_of(sq) as i32;
+            let mut r = rank_of(sq) as i32 + if side_idx == 0 { -1 } else { 1 };
+            while r >= 0 && r <= 7 {
+                let idx = (r * 8 + f) as u8;
+                if let Some(pc) = b.piece_at(idx) {
+                    if pc.side
+                        == (if side_idx == 0 {
+                            Side::White
+                        } else {
+                            Side::Black
+                        })
+                        && matches!(pc.kind, PieceKind::Rook)
+                    {
+                        eg += sign * (p.rook_behind_passer as i32);
+                    }
+                    break;
+                }
+                r += if side_idx == 0 { -1 } else { 1 };
+            }
+        }
+    }
+
+    // King pawn shield (front three squares one rank ahead) - middlegame
     for side_idx in 0..2 {
         if let Some(ksq) = king_sq[side_idx] {
             let kf = file_of(ksq) as i32;
@@ -942,16 +1001,81 @@ fn eval(b: &Board) -> i16 {
                         missing += 1;
                     }
                 }
-                s += if side_idx == 0 {
-                    (p.king_shield_missing as i32) * missing
+                let pen = (p.king_shield_missing as i32) * missing;
+                if side_idx == 0 {
+                    mg += pen;
                 } else {
-                    -(p.king_shield_missing as i32) * missing
-                };
+                    mg -= pen;
+                }
             }
         }
     }
 
-    let out = if b.stm == Side::White { s } else { -s };
+    // King ring penalty (undefended attacked squares around king)
+    for side_idx in 0..2 {
+        if let Some(ksq) = king_sq[side_idx] {
+            let kf = file_of(ksq) as i32;
+            let kr = rank_of(ksq) as i32;
+            let my_side = if side_idx == 0 {
+                Side::White
+            } else {
+                Side::Black
+            };
+            let enemy = my_side.flip();
+            for df in -1..=1 {
+                for dr in -1..=1 {
+                    if df == 0 && dr == 0 {
+                        continue;
+                    }
+                    if let Some(t) = crate::types::sq(kf + df, kr + dr) {
+                        if square_attacked(b, t, enemy) && !square_attacked(b, t, my_side) {
+                            if side_idx == 0 {
+                                mg -= p.king_ring_penalty as i32;
+                            } else {
+                                mg += p.king_ring_penalty as i32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Mobility (legal move counts) - middlegame
+    let mut mob = [[0i32; 4]; 2];
+    for (side_idx, side) in [Side::White, Side::Black].iter().enumerate() {
+        let mut bb = b.clone();
+        if bb.stm != *side {
+            bb.stm = *side;
+            bb.key ^= bb.zob.stm;
+        }
+        let moves = legal_moves(&bb);
+        for mv in moves {
+            if let Some(pc) = bb.piece_at(mv.from) {
+                match pc.kind {
+                    PieceKind::Knight => mob[side_idx][0] += 1,
+                    PieceKind::Bishop => mob[side_idx][1] += 1,
+                    PieceKind::Rook => mob[side_idx][2] += 1,
+                    PieceKind::Queen => mob[side_idx][3] += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    mg += (mob[0][0] - mob[1][0]) * p.mobility_knight as i32;
+    mg += (mob[0][1] - mob[1][1]) * p.mobility_bishop as i32;
+    mg += (mob[0][2] - mob[1][2]) * p.mobility_rook as i32;
+    mg += (mob[0][3] - mob[1][3]) * p.mobility_queen as i32;
+
+    // Blend middlegame and endgame scores
+    let denom = (p.mg_weight as i32 + p.eg_weight as i32).max(1);
+    let blended = (mg * p.mg_weight as i32 + eg * p.eg_weight as i32) / denom;
+
+    let out = if b.stm == Side::White {
+        blended
+    } else {
+        -blended
+    };
     out as i16
 }
 
