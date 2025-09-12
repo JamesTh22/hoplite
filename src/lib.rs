@@ -7,5 +7,6 @@ pub mod search;
 pub mod zobrist;
 pub mod tt;
 pub mod params;
+pub mod endgame;
 
 pub mod perft;

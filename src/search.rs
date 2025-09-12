@@ -202,7 +202,7 @@ impl Search {
 
     // Time-limited
     // Dynamic time management based on position complexity and game phase
-    fn allocate_time(&self, total_time_ms: u128, b: &Board) -> u128 {
+    fn allocate_time(&self, total_time_ms: u128, b: &mut Board) -> u128 {
         // Count material to estimate game phase (0-256)
         let mut phase = 0;
         let mut total_pieces = 0;
@@ -277,7 +277,6 @@ impl Search {
         let mut best = Move::default();
         let mut last_score: i16 = 0;
         let mut stable_count = 0; // Track stability
-        let mut prev_nodes = 0; // Track node count for progress assessment
         let start = Instant::now();
 
         for d in 1..=64 {
@@ -908,7 +907,7 @@ impl Search {
 
     fn score_moves(
         &self,
-        b: &Board,
+        b: &mut Board,
         moves: &[Move],
         ply: usize,
         tt_move: Option<Move>,
@@ -916,7 +915,7 @@ impl Search {
         let mut v: Vec<(i32, Move)> = Vec::with_capacity(moves.len());
         // Pre-calculate king and queen positions for move targeting bonus
         let mut king_sqs = [None::<u8>; 2];
-        let mut queen_sqs = [Vec::new(); 2];
+        let mut queen_sqs = [Vec::new(), Vec::new()];
         for i in 0..64u8 {
             if let Some(pc) = b.piece_at(i) {
                 let side_idx = if pc.side == Side::White { 0 } else { 1 };
@@ -948,7 +947,7 @@ impl Search {
                     
                     // Bonus for capturing with lesser pieces
                     if let Some(attacker) = b.piece_at(mv.from) {
-                        if piece_value(attacker.kind) < piece_value(victim.kind) {
+                        if Self::piece_value(attacker.kind) < Self::piece_value(victim.kind) {
                             s += 5000;
                         }
                     }
@@ -1027,17 +1026,16 @@ impl Search {
         v
     }
 
-fn piece_value(kind: PieceKind) -> i32 {
-    use PieceKind::*;
-    match kind {
-        Pawn => 100,
-        Knight => 320,
-        Bishop => 330,
-        Rook => 500,
-        Queen => 900,
-        King => 10000,
-    }
-}
+    fn piece_value(kind: PieceKind) -> i32 {
+        use PieceKind::*;
+        match kind {
+            Pawn => 100,
+            Knight => 320,
+            Bishop => 330,
+            Rook => 500,
+            Queen => 900,
+            King => 10000,
+        }
     }
 }
 
@@ -1607,3 +1605,4 @@ fn futility_margin(depth: i32) -> i16 {
     // Scale margin up in late game positions
     let phase_bonus = if depth > 1 { depth as i16 * 25 } else { 0 };
     base + phase_bonus
+}

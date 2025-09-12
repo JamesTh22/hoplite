@@ -158,7 +158,7 @@ fn add(moves: &mut Vec<Move>, from: u8, to: u8) {
 
 pub fn legal_moves(b: &Board) -> Vec<Move> {
     // Check cache first
-    if let Some(cached) = super::movecache::get_cached_legal_moves(b.key) {
+    if let Some(cached) = self::movecache::get_cached_legal_moves(b.key) {
         return cached;
     }
 
@@ -196,7 +196,7 @@ pub fn legal_moves(b: &Board) -> Vec<Move> {
     }
 
     // Cache the results
-    super::movecache::store_legal_moves(b.key, legal.clone());
+    self::movecache::store_legal_moves(b.key, legal.clone());
     legal
 }
 
