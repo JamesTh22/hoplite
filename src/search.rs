@@ -1,6 +1,7 @@
 use crate::board::Board;
 use crate::movegen::{legal_moves, square_attacked};
 use crate::params::PARAMS;
+use crate::endgame;
 use crate::tt::{Bound, Entry, TT};
 use crate::types::{Move, PieceKind, Side};
 use parking_lot::Mutex;
@@ -1559,7 +1560,7 @@ fn eval(b: &Board) -> i16 {
     let mut blended = (mg * p.mg_weight as i32 + eg * p.eg_weight as i32) / denom;
 
     // Apply endgame-specific scoring adjustments
-    let endgame_adjustment = crate::endgame::get_endgame_score_adjustment(b);
+    let endgame_adjustment = endgame::get_endgame_score_adjustment(b);
     blended += endgame_adjustment as i32;
 
     let out = if b.stm == Side::White {
