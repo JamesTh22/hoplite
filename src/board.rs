@@ -119,6 +119,17 @@ impl Board {
     #[inline]
     pub fn piece_at(&self, sq: u8) -> Option<Piece> { self.pieces[sq as usize] }
 
+    #[inline]
+    pub fn occupancy(&self) -> u64 {
+        let mut occ = 0u64;
+        for i in 0..64 {
+            if self.pieces[i].is_some() {
+                occ |= 1u64 << i;
+            }
+        }
+        occ
+    }
+
     fn recompute_key(&mut self) {
         let mut k=0u64;
         for i in 0..64 {

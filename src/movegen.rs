@@ -3,6 +3,9 @@ use crate::types::{sq, Move, PieceKind, Side};
 
 use lazy_static::lazy_static;
 
+const ROOK_DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+const BISHOP_DIRS: [(i32, i32); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+
 lazy_static! {
     // Pre-computed knight move targets for each square as bitboards
     static ref KNIGHT_TARGETS: [u64; 64] = {
@@ -36,6 +39,111 @@ lazy_static! {
         }
         arr
     };
+
+    static ref ROOK_MASKS: [u64; 64] = generate_masks(&ROOK_DIRS);
+    static ref BISHOP_MASKS: [u64; 64] = generate_masks(&BISHOP_DIRS);
+    static ref ROOK_ATTACKS: Vec<Vec<u64>> = generate_tables(&ROOK_DIRS, &ROOK_MASKS);
+    static ref BISHOP_ATTACKS: Vec<Vec<u64>> = generate_tables(&BISHOP_DIRS, &BISHOP_MASKS);
+}
+
+fn generate_masks(dirs: &[(i32, i32); 4]) -> [u64; 64] {
+    let mut arr = [0u64; 64];
+    for s in 0u8..64 {
+        let f = (s % 8) as i32;
+        let r = (s / 8) as i32;
+        for (df, dr) in dirs.iter() {
+            let mut nf = f + df;
+            let mut nr = r + dr;
+            while let Some(t) = sq(nf, nr) {
+                if (nf == 0 && *df == -1)
+                    || (nf == 7 && *df == 1)
+                    || (nr == 0 && *dr == -1)
+                    || (nr == 7 && *dr == 1)
+                {
+                    break;
+                }
+                arr[s as usize] |= 1u64 << t;
+                nf += df;
+                nr += dr;
+            }
+        }
+    }
+    arr
+}
+
+fn generate_tables(dirs: &[(i32, i32); 4], masks: &[u64; 64]) -> Vec<Vec<u64>> {
+    let mut tables: Vec<Vec<u64>> = Vec::with_capacity(64);
+    for s in 0u8..64 {
+        let mask = masks[s as usize];
+        let bits = mask.count_ones();
+        let mut table = vec![0u64; 1 << bits];
+        for idx in 0..(1 << bits) {
+            let occ = set_occupancy(idx as usize, bits, mask);
+            table[idx as usize] = slider_attacks_from(s, occ, dirs);
+        }
+        tables.push(table);
+    }
+    tables
+}
+
+fn set_occupancy(index: usize, bits: u32, mask: u64) -> u64 {
+    let mut occ = 0u64;
+    let mut bitboard = mask;
+    for i in 0..bits {
+        let sq = bitboard.trailing_zeros() as u8;
+        bitboard &= bitboard - 1;
+        if (index & (1 << i)) != 0 {
+            occ |= 1u64 << sq;
+        }
+    }
+    occ
+}
+
+fn slider_attacks_from(s: u8, occ: u64, dirs: &[(i32, i32); 4]) -> u64 {
+    let f = (s % 8) as i32;
+    let r = (s / 8) as i32;
+    let mut attacks = 0u64;
+    for (df, dr) in dirs.iter() {
+        let mut nf = f + df;
+        let mut nr = r + dr;
+        while let Some(t) = sq(nf, nr) {
+            attacks |= 1u64 << t;
+            if (occ & (1u64 << t)) != 0 {
+                break;
+            }
+            nf += df;
+            nr += dr;
+        }
+    }
+    attacks
+}
+
+fn occupancy_to_index(mut occ: u64, mask: u64) -> usize {
+    occ &= mask;
+    let mut index = 0usize;
+    let mut bits = mask;
+    let mut i = 0;
+    while bits != 0 {
+        let sq = bits.trailing_zeros();
+        bits &= bits - 1;
+        if occ & (1u64 << sq) != 0 {
+            index |= 1 << i;
+        }
+        i += 1;
+    }
+    index
+}
+
+fn rook_attacks(occ: u64, s: u8) -> u64 {
+    let mask = ROOK_MASKS[s as usize];
+    let idx = occupancy_to_index(occ, mask);
+    ROOK_ATTACKS[s as usize][idx]
+}
+
+fn bishop_attacks(occ: u64, s: u8) -> u64 {
+    let mask = BISHOP_MASKS[s as usize];
+    let idx = occupancy_to_index(occ, mask);
+    BISHOP_ATTACKS[s as usize][idx]
 }
 
 #[inline]
@@ -65,6 +173,7 @@ pub fn legal_moves(b: &Board) -> Vec<Move> {
 
 pub fn pseudo_legal(b: &Board, out: &mut Vec<Move>) {
     let side = b.stm;
+    let occ = b.occupancy();
     for sqi in 0u8..64 {
         if let Some(p) = b.piece_at(sqi) {
             if p.side != side {
@@ -74,27 +183,12 @@ pub fn pseudo_legal(b: &Board, out: &mut Vec<Move>) {
                 PieceKind::Pawn => pawn_moves(b, sqi, p.side, out),
                 PieceKind::Knight => knight_moves(b, sqi, p.side, out),
                 PieceKind::Bishop => {
-                    slider_moves(b, sqi, p.side, out, &[(1, 1), (1, -1), (-1, 1), (-1, -1)])
+                    slider_moves(b, sqi, p.side, out, PieceKind::Bishop, occ)
                 }
                 PieceKind::Rook => {
-                    slider_moves(b, sqi, p.side, out, &[(1, 0), (-1, 0), (0, 1), (0, -1)])
+                    slider_moves(b, sqi, p.side, out, PieceKind::Rook, occ)
                 }
-                PieceKind::Queen => slider_moves(
-                    b,
-                    sqi,
-                    p.side,
-                    out,
-                    &[
-                        (1, 1),
-                        (1, -1),
-                        (-1, 1),
-                        (-1, -1),
-                        (1, 0),
-                        (-1, 0),
-                        (0, 1),
-                        (0, -1),
-                    ],
-                ),
+                PieceKind::Queen => slider_moves(b, sqi, p.side, out, PieceKind::Queen, occ),
                 PieceKind::King => king_moves(b, sqi, p.side, out),
             }
         }
@@ -251,27 +345,20 @@ fn castling_moves(b: &Board, side: Side, out: &mut Vec<Move>) {
     }
 }
 
-fn slider_moves(b: &Board, s: u8, side: Side, out: &mut Vec<Move>, dirs: &[(i32, i32)]) {
-    let f = (s % 8) as i32;
-    let r = (s / 8) as i32;
-    for (df, dr) in dirs {
-        let mut nf = f + df;
-        let mut nr = r + dr;
-        loop {
-            if let Some(t) = sq(nf, nr) {
-                if let Some(p) = b.piece_at(t) {
-                    if p.side != side {
-                        add(out, s, t);
-                    }
-                    break;
-                } else {
-                    add(out, s, t);
-                }
-                nf += df;
-                nr += dr;
-            } else {
-                break;
-            }
+fn slider_moves(b: &Board, s: u8, side: Side, out: &mut Vec<Move>, kind: PieceKind, occ: u64) {
+    let mut bb = match kind {
+        PieceKind::Bishop => bishop_attacks(occ, s),
+        PieceKind::Rook => rook_attacks(occ, s),
+        PieceKind::Queen => bishop_attacks(occ, s) | rook_attacks(occ, s),
+        _ => 0,
+    };
+    while bb != 0 {
+        let t = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        match b.piece_at(t) {
+            None => add(out, s, t),
+            Some(p) if p.side != side => add(out, s, t),
+            _ => {}
         }
     }
 }
@@ -279,6 +366,7 @@ fn slider_moves(b: &Board, s: u8, side: Side, out: &mut Vec<Move>, dirs: &[(i32,
 pub fn square_attacked(b: &Board, s: u8, by: Side) -> bool {
     let f = (s % 8) as i32;
     let r = (s / 8) as i32;
+    let occ = b.occupancy();
     // pawn attacks
     let dir = if by == Side::White { -1 } else { 1 };
     for df in [-1, 1] {
@@ -312,42 +400,25 @@ pub fn square_attacked(b: &Board, s: u8, by: Side) -> bool {
             }
         }
     }
-    // sliders
-    if slider_attack(b, s, by, &[(1, 1), (1, -1), (-1, 1), (-1, -1)], true) {
-        return true;
+    // rook/queen sliders
+    let mut rbb = rook_attacks(occ, s);
+    while rbb != 0 {
+        let t = rbb.trailing_zeros() as u8;
+        rbb &= rbb - 1;
+        if let Some(p) = b.piece_at(t) {
+            if p.side == by && matches!(p.kind, PieceKind::Rook | PieceKind::Queen) {
+                return true;
+            }
+        }
     }
-    if slider_attack(b, s, by, &[(1, 0), (-1, 0), (0, 1), (0, -1)], false) {
-        return true;
-    }
-    false
-}
-
-fn slider_attack(b: &Board, s: u8, by: Side, dirs: &[(i32, i32)], diag: bool) -> bool {
-    let f = (s % 8) as i32;
-    let r = (s / 8) as i32;
-    for (df, dr) in dirs {
-        let mut nf = f + df;
-        let mut nr = r + dr;
-        loop {
-            if let Some(t) = sq(nf, nr) {
-                if let Some(p) = b.piece_at(t) {
-                    if p.side == by {
-                        if diag {
-                            if matches!(p.kind, PieceKind::Bishop | PieceKind::Queen) {
-                                return true;
-                            }
-                        } else {
-                            if matches!(p.kind, PieceKind::Rook | PieceKind::Queen) {
-                                return true;
-                            }
-                        }
-                    }
-                    break;
-                }
-                nf += df;
-                nr += dr;
-            } else {
-                break;
+    // bishop/queen sliders
+    let mut bbb = bishop_attacks(occ, s);
+    while bbb != 0 {
+        let t = bbb.trailing_zeros() as u8;
+        bbb &= bbb - 1;
+        if let Some(p) = b.piece_at(t) {
+            if p.side == by && matches!(p.kind, PieceKind::Bishop | PieceKind::Queen) {
+                return true;
             }
         }
     }
