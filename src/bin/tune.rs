@@ -24,7 +24,11 @@ fn play_game(p_white: &Params, p_black: &Params, seed: u64, movetime_ms: u128, m
             if ms.is_empty() { break; }
             ms[rng.gen::<usize>() % ms.len()]
         } else {
-            if side_white { s_white.bestmove_time(&mut b, movetime_ms) } else { s_black.bestmove_time(&mut b, movetime_ms) }
+            if side_white {
+                s_white.bestmove_time(&mut b, movetime_ms).0
+            } else {
+                s_black.bestmove_time(&mut b, movetime_ms).0
+            }
         };
 
         if mv.from==0 && mv.to==0 { return 0.5; }
