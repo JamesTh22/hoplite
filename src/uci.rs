@@ -24,7 +24,7 @@ impl Uci {
             let Ok(line) = line else { continue };
             let line = line.trim().to_string();
             if line == "uci" {
-                writeln!(out, "id name Hoplite 0.1.0").unwrap();
+                writeln!(out, "id name Hoplite {}", env!("CARGO_PKG_VERSION")).unwrap();
                 writeln!(out, "id author you").unwrap();
                 writeln!(out, "option name Hash type spin default 64 min 1 max 4096").unwrap();
                 writeln!(out, "option name Threads type spin default 1 min 1 max 64").unwrap();
@@ -99,33 +99,6 @@ impl Uci {
                 }
             } else if line == "saveparams" {
                 let _ = crate::params::save_params_to("params.json");
-
-                // setoption name <Name> value <Val>
-                let mut name = String::new();
-                let mut val = String::new();
-                let mut it = line.split_whitespace();
-                it.next(); // setoption
-                if it.next() == Some("name") {
-                    while let Some(tok) = it.next() {
-                        if tok == "value" {
-                            break;
-                        }
-                        if !name.is_empty() {
-                            name.push(' ');
-                        }
-                        name.push_str(tok);
-                    }
-                    val = it.collect::<Vec<_>>().join(" ");
-                }
-                if name.eq_ignore_ascii_case("Hash") {
-                    if let Ok(mb) = val.trim().parse::<usize>() {
-                        self.search.set_hash_mb(mb);
-                    }
-                } else if name.eq_ignore_ascii_case("Threads") {
-                    if let Ok(n) = val.trim().parse::<usize>() {
-                        self.search.set_threads(n);
-                    }
-                }
             } else if line == "isready" {
                 writeln!(out, "readyok").unwrap();
             } else if line.starts_with("ucinewgame") {

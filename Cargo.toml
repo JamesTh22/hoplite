@@ -1,7 +1,7 @@
 
 [package]
 name = "hoplite"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 description = "Hoplite: a Rust chess engine scaffold with UCI, legal movegen (basic), alpha-beta, and TT stubs."
 license = "MIT"
