@@ -611,7 +611,7 @@ impl Search {
         }
 
         // Transposition table lookup
-        let tt_entry = {
+        let mut tt_entry = {
             let tt = self.tt.lock();
             tt.probe(b.key)
         };
