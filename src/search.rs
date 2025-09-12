@@ -158,6 +158,12 @@ impl Search {
                 break;
             }
         }
+        if let Some(deadline) = self.deadline {
+            let now = Instant::now();
+            if now < deadline {
+                std::thread::sleep(deadline - now);
+            }
+        }
         best
     }
 
