@@ -1,20 +1,29 @@
 {
   "piece_val": [
-    100,
-    320,
-    330,
-    500,
-    900,
-    0
+    110,
+    360,
+    280,
+    520,
+    840,
+    -50
   ],
   "pst_scale": [
+    1.8000002,
+    0.39999992,
     1.0,
+    2.3999999,
     1.0,
-    1.0,
-    1.0,
-    1.0,
-    1.0
+    1.2
   ],
+  "mg_weight": 192,
+  "eg_weight": 64,
+  "mobility_knight": 2,
+  "mobility_bishop": 3,
+  "mobility_rook": 2,
+  "mobility_queen": 1,
+  "connected_passers": 20,
+  "rook_behind_passer": 15,
+  "king_ring_penalty": 2,
   "bishop_pair": 30,
   "rook_open_file": 15,
   "rook_semi_open_file": 7,
@@ -30,14 +39,5 @@
     90,
     0
   ],
-  "king_shield_missing": -12,
-  "mg_weight": 192,
-  "eg_weight": 64,
-  "mobility_knight": 2,
-  "mobility_bishop": 3,
-  "mobility_rook": 2,
-  "mobility_queen": 1,
-  "connected_passers": 20,
-  "rook_behind_passer": 15,
-  "king_ring_penalty": 2
+  "king_shield_missing": -12
 }

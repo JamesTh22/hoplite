@@ -63,6 +63,14 @@ pub struct Search {
 }
 
 impl Search {
+    // Helper method to check if last move was a capture
+    fn last_was_capture(&self, history: &[u64]) -> bool {
+        if history.len() < 2 { return false; }
+        // If Zobrist hash changed by more than a move and side-to-move, likely a capture
+        let xor = history[history.len()-1] ^ history[history.len()-2];
+        xor.count_ones() > 2
+    }
+
     pub fn new() -> Self {
         Self {
             nodes: 0,
@@ -132,6 +140,7 @@ impl Search {
         self.deadline = None;
         let mut best = Move::default();
         let mut last_score: i16 = 0;
+        let mut stable_count = 0;  // Track how many times the best move remains stable
         let start = Instant::now();
 
         for d in 1..=depth {
@@ -139,8 +148,24 @@ impl Search {
             if pvs.is_empty() {
                 break;
             }
-            last_score = pvs[0].1;
-            best = pvs[0].0[0];
+            let new_score = pvs[0].1;
+            let new_best = pvs[0].0[0];
+            
+            // Check if the best move is stable across iterations 
+            if d > 1 {
+                if new_best.from == best.from && new_best.to == best.to {
+                    stable_count += 1;
+                    // If move is stable for 2 iterations and we're past depth 6, return early
+                    if stable_count >= 2 && d >= 6 {
+                        break;
+                    }
+                } else {
+                    stable_count = 0;
+                }
+            }
+            
+            last_score = new_score;
+            best = new_best;
             let elapsed = start.elapsed().as_millis();
             if self.multipv > 1 {
                 for (idx, (pv, sc)) in pvs.iter().enumerate() {
@@ -183,6 +208,7 @@ impl Search {
         self.deadline = Some(Instant::now() + Duration::from_millis(time_ms as u64));
         let mut best = Move::default();
         let mut last_score: i16 = 0;
+        let mut stable_count = 0; // Track stability
         let start = Instant::now();
 
         for d in 1..=64 {
@@ -190,8 +216,24 @@ impl Search {
             if pvs.is_empty() {
                 break;
             }
-            last_score = pvs[0].1;
-            best = pvs[0].0[0];
+            let new_score = pvs[0].1;
+            let new_best = pvs[0].0[0];
+            
+            // Check if the best move is stable across iterations
+            if d > 1 {
+                if new_best.from == best.from && new_best.to == best.to {
+                    stable_count += 1;
+                    // If move is stable for 2 iterations and we're past depth 6, return early
+                    if stable_count >= 2 && d >= 6 {
+                        break;
+                    }
+                } else {
+                    stable_count = 0;
+                }
+            }
+            
+            last_score = new_score;
+            best = new_best;
             let elapsed = start.elapsed().as_millis();
             if self.multipv > 1 {
                 for (idx, (pv, sc)) in pvs.iter().enumerate() {
@@ -241,6 +283,7 @@ impl Search {
         self.deadline = None;
         let mut best = Move::default();
         let mut last_score: i16 = 0;
+        let mut stable_count = 0; // Track stability
         let start = Instant::now();
 
         for d in 1..=64 {
@@ -248,8 +291,24 @@ impl Search {
             if pvs.is_empty() {
                 break;
             }
-            last_score = pvs[0].1;
-            best = pvs[0].0[0];
+            let new_score = pvs[0].1;
+            let new_best = pvs[0].0[0];
+            
+            // Check if the best move is stable across iterations
+            if d > 1 {
+                if new_best.from == best.from && new_best.to == best.to {
+                    stable_count += 1;
+                    // If move is stable for 2 iterations and we're past depth 6, return early
+                    if stable_count >= 2 && d >= 6 {
+                        break;
+                    }
+                } else {
+                    stable_count = 0;
+                }
+            }
+            
+            last_score = new_score;
+            best = new_best;
             let elapsed = start.elapsed().as_millis();
             if self.multipv > 1 {
                 for (idx, (pv, sc)) in pvs.iter().enumerate() {
@@ -292,6 +351,8 @@ impl Search {
         prev_score: i16,
         multipv: usize,
     ) -> Vec<(Vec<Move>, i16)> {
+        const ASPIRATION_WINDOW: i16 = 50; // Initial window size
+        const ASPIRATION_DELTA: i16 = 25;  // Window growth increment
         let moves = legal_moves(b);
         if moves.is_empty() {
             return Vec::new();
@@ -371,16 +432,24 @@ impl Search {
                     break;
                 }
                 let u = b.make_move(mv);
-                let is_capture = b.piece_at(mv.to).is_some();
-                let mut new_depth = depth - 1;
+            let is_capture = b.piece_at(mv.to).is_some();
+            let mut new_depth = depth - 1;
 
-                // Check extension
-                let gave_check = b.in_check(b.stm);
-                if gave_check {
-                    new_depth += 1;
-                }
-
-                // LMR
+            // Enhanced positional extensions
+            let gave_check = b.in_check(b.stm);
+            let is_pawn_push = if let Some(p) = b.piece_at(mv.from) {
+                matches!(p.kind, PieceKind::Pawn) && 
+                (mv.to / 8 == 6 || mv.to / 8 == 1) // 7th/2nd rank
+            } else { false };
+            let is_recapture = is_capture && self.last_was_capture(history_keys);
+            
+            // Extend search in critical positions
+            if gave_check { new_depth += 1; }
+            if is_pawn_push { new_depth += 1; }
+            if is_recapture { new_depth += 1; }
+            
+            // But limit total extension
+            new_depth = new_depth.min(depth + 2);                // LMR
                 if depth >= 3 && !is_capture && !gave_check {
                     let d = depth as i32;
                     let mut r = 1 + (d / 3);
