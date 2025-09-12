@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::io::{self, Write};
 
 const MAX_PLY: usize = 128;
 #[inline]
@@ -101,15 +102,26 @@ impl Search {
         self.deadline = None;
         let mut best = Move::default();
         let mut last_score: i16 = 0;
+        let start = Instant::now();
 
         for d in 1..=depth {
             let (m, sc) = self.search_root(b, d, &mut history_keys, last_score);
-            if self.stop {
-                break;
-            }
             last_score = sc;
             if m.from != 0 || m.to != 0 {
                 best = m;
+            }
+            let elapsed = start.elapsed().as_millis();
+            println!(
+                "info depth {} score cp {} time {} nodes {} pv {}",
+                d,
+                sc,
+                elapsed,
+                self.nodes,
+                best.uci()
+            );
+            let _ = io::stdout().flush();
+            if self.stop {
+                break;
             }
         }
         best
@@ -123,6 +135,7 @@ impl Search {
         self.deadline = Some(Instant::now() + Duration::from_millis(time_ms as u64));
         let mut best = Move::default();
         let mut last_score: i16 = 0;
+        let start = Instant::now();
 
         for d in 1..=64 {
             let (m, sc) = self.search_root(b, d, &mut history_keys, last_score);
@@ -130,6 +143,16 @@ impl Search {
             if m.from != 0 || m.to != 0 {
                 best = m;
             }
+            let elapsed = start.elapsed().as_millis();
+            println!(
+                "info depth {} score cp {} time {} nodes {} pv {}",
+                d,
+                sc,
+                elapsed,
+                self.nodes,
+                best.uci()
+            );
+            let _ = io::stdout().flush();
             if self.time_up() {
                 self.stop = true;
                 break;
@@ -693,13 +716,80 @@ fn ray_clear(
     true
 }
 
-// --- Evaluation (temporary minimal eval; real eval is elsewhere) ---
+// --- Evaluation with piece-square tables and positional heuristics ---
 fn eval(b: &Board) -> i16 {
+    // PSTs from White's perspective
+    const PAWN: [i16; 64] = [
+        0, 5, 5, -5, -5, 5, 5, 0, 0, 10, -5, 0, 0, -5, 10, 0, 0, 10, 10, 20, 20, 10, 10, 0, 5,
+        10, 20, 35, 35, 20, 10, 5, 10, 20, 30, 40, 40, 30, 20, 10, 15, 25, 35, 45, 45, 35, 25,
+        15, 20, 30, 30, 0, 0, 30, 30, 20, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const KNIGHT: [i16; 64] = [
+        -50, -30, -10, -10, -10, -10, -30, -50, -30, -5, 5, 10, 10, 5, -5, -30, -10, 10, 15, 20,
+        20, 15, 10, -10, -10, 5, 20, 25, 25, 20, 5, -10, -10, 5, 20, 25, 25, 20, 5, -10, -10, 10,
+        15, 20, 20, 15, 10, -10, -30, -5, 5, 10, 10, 5, -5, -30, -50, -30, -10, -10, -10, -10,
+        -30, -50,
+    ];
+    const BISHOP: [i16; 64] = [
+        -20, -10, -10, -10, -10, -10, -10, -20, -10, 5, 0, 5, 5, 0, 5, -10, -10, 10, 10, 15, 15,
+        10, 10, -10, -10, 10, 15, 20, 20, 15, 10, -10, -10, 10, 15, 20, 20, 15, 10, -10, -10, 10,
+        10, 15, 15, 10, 10, -10, -10, 5, 0, 5, 5, 0, 5, -10, -20, -10, -10, -10, -10, -10, -10,
+        -20,
+    ];
+    const ROOK: [i16; 64] = [
+        0, 0, 5, 10, 10, 5, 0, 0, 0, 0, 5, 10, 10, 5, 0, 0, 0, 0, 5, 10, 10, 5, 0, 0, 5, 10, 10,
+        15, 15, 10, 10, 5, 5, 10, 10, 15, 15, 10, 10, 5, 0, 0, 5, 10, 10, 5, 0, 0, 0, 0, 5, 10,
+        10, 5, 0, 0, 0, 0, 5, 10, 10, 5, 0, 0,
+    ];
+    const QUEEN: [i16; 64] = [
+        -20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5, 0,
+        -10, -5, 0, 5, 10, 10, 5, 0, -5, -5, 0, 5, 10, 10, 5, 0, -5, -10, 0, 5, 5, 5, 5, 0, -10,
+        -10, 0, 0, 0, 0, 0, 0, -10, -20, -10, -10, -5, -5, -10, -10, -20,
+    ];
+    const KING: [i16; 64] = [
+        -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -30, -40,
+        -40, -50, -50, -40, -40, -30, -30, -30, -30, -40, -40, -30, -30, -30, -20, -20, -20, -20,
+        -20, -20, -20, -20, -10, -10, -10, -10, -10, -10, -10, -10, 20, 20, 0, 0, 0, 0, 20, 20, 20,
+        30, 10, 0, 0, 10, 30, 20,
+    ];
+
     let p = PARAMS.read();
     let pv = p.piece_val;
+
+    // Material + PST
     let mut s: i32 = 0;
+    let mut bishops = [0u8; 2];
+    let mut pawns_by_file = [[0u8; 8]; 2];
+    let mut king_sq = [None::<u8>; 2];
     for i in 0..64u8 {
         if let Some(pc) = b.piece_at(i) {
+            let side_idx = if matches!(pc.side, Side::White) { 0 } else { 1 };
+            if matches!(pc.kind, PieceKind::Bishop) {
+                bishops[side_idx] += 1;
+            }
+            if matches!(pc.kind, PieceKind::Pawn) {
+                pawns_by_file[side_idx][file_of(i)] += 1;
+            }
+            if matches!(pc.kind, PieceKind::King) {
+                king_sq[side_idx] = Some(i);
+            }
+
+            let idx_white = i as usize;
+            let idx_black = (63 - i) as usize;
+            let (pst, scale) = match pc.kind {
+                PieceKind::Pawn => (&PAWN, p.pst_scale[0]),
+                PieceKind::Knight => (&KNIGHT, p.pst_scale[1]),
+                PieceKind::Bishop => (&BISHOP, p.pst_scale[2]),
+                PieceKind::Rook => (&ROOK, p.pst_scale[3]),
+                PieceKind::Queen => (&QUEEN, p.pst_scale[4]),
+                PieceKind::King => (&KING, p.pst_scale[5]),
+            };
+            let pst_score = if pc.side == Side::White {
+                pst[idx_white]
+            } else {
+                pst[idx_black]
+            };
+            let pst_scaled = (pst_score as f32 * scale) as i16;
             let val = match pc.kind {
                 PieceKind::Pawn => pv[0] as i32,
                 PieceKind::Knight => pv[1] as i32,
@@ -708,12 +798,163 @@ fn eval(b: &Board) -> i16 {
                 PieceKind::Queen => pv[4] as i32,
                 PieceKind::King => pv[5] as i32,
             };
-            s += if pc.side == Side::White { val } else { -val };
+            let term = (val as i16 + pst_scaled) as i32;
+            s += if pc.side == Side::White { term } else { -term };
         }
     }
-    if b.stm == Side::White {
-        s as i16
-    } else {
-        (-s) as i16
+
+    // Bishop pair
+    if bishops[0] >= 2 {
+        s += p.bishop_pair as i32;
     }
+    if bishops[1] >= 2 {
+        s -= p.bishop_pair as i32;
+    }
+
+    // Rook on open / semi-open files
+    for i in 0..64u8 {
+        if let Some(pc) = b.piece_at(i) {
+            if matches!(pc.kind, PieceKind::Rook) {
+                let side_idx = if pc.side == Side::White { 0 } else { 1 };
+                let f = file_of(i);
+                let friendly_pawns = pawns_by_file[side_idx][f];
+                let enemy_pawns = pawns_by_file[1 - side_idx][f];
+                if friendly_pawns == 0 && enemy_pawns == 0 {
+                    s += if side_idx == 0 {
+                        p.rook_open_file as i32
+                    } else {
+                        -(p.rook_open_file as i32)
+                    };
+                } else if friendly_pawns == 0 && enemy_pawns > 0 {
+                    s += if side_idx == 0 {
+                        p.rook_semi_open_file as i32
+                    } else {
+                        -(p.rook_semi_open_file as i32)
+                    };
+                }
+            }
+        }
+    }
+
+    // Pawn structure: isolated, doubled, passed (rank-based)
+    for side_idx in 0..2 {
+        let sign = if side_idx == 0 { 1 } else { -1 };
+        // doubled
+        for f in 0..8 {
+            if pawns_by_file[side_idx][f] > 1 {
+                let extra = (pawns_by_file[side_idx][f] - 1) as i32;
+                s += sign * extra * (p.doubled_pawn as i32);
+            }
+        }
+        // isolated & passed per pawn
+        for i in 0..64u8 {
+            if let Some(pc) = b.piece_at(i) {
+                if (side_idx == 0 && pc.side == Side::White)
+                    || (side_idx == 1 && pc.side == Side::Black)
+                {
+                    if matches!(pc.kind, PieceKind::Pawn) {
+                        let f = file_of(i) as i32;
+                        let r = rank_of(i) as i32;
+                        // isolated
+                        let left = if f > 0 {
+                            pawns_by_file[side_idx][(f - 1) as usize]
+                        } else {
+                            0
+                        };
+                        let right = if f < 7 {
+                            pawns_by_file[side_idx][(f + 1) as usize]
+                        } else {
+                            0
+                        };
+                        if left == 0 && right == 0 {
+                            s += sign * (p.isolated_pawn as i32);
+                        }
+
+                        // passed: scan enemy pawns
+                        let mut enemy_block = false;
+                        for sq in 0..64u8 {
+                            if let Some(ep) = b.piece_at(sq) {
+                                if ep.side
+                                    != (if side_idx == 0 {
+                                        Side::Black
+                                    } else {
+                                        Side::White
+                                    })
+                                {
+                                    continue;
+                                }
+                                if !matches!(ep.kind, PieceKind::Pawn) {
+                                    continue;
+                                }
+                                let ef = file_of(sq) as i32;
+                                let er = rank_of(sq) as i32;
+                                if (ef - f).abs() <= 1 {
+                                    if side_idx == 0 {
+                                        if er > r {
+                                            enemy_block = true;
+                                        }
+                                    } else if er < r {
+                                        enemy_block = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !enemy_block {
+                            let rel_rank = if side_idx == 0 { r } else { 7 - r };
+                            let idx = rel_rank.clamp(0, 7) as usize;
+                            s += sign * (p.passed_pawn[idx] as i32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // King pawn shield (front three squares one rank ahead)
+    for side_idx in 0..2 {
+        if let Some(ksq) = king_sq[side_idx] {
+            let kf = file_of(ksq) as i32;
+            let kr = rank_of(ksq) as i32;
+            let target_rank = kr + if side_idx == 0 { 1 } else { -1 };
+            if target_rank >= 0 && target_rank <= 7 {
+                let mut missing = 0i32;
+                for df in -1..=1 {
+                    let nf = kf + df;
+                    if nf < 0 || nf > 7 {
+                        continue;
+                    }
+                    let idx = (target_rank * 8 + nf) as usize;
+                    let pawn_here = match b.pieces[idx] {
+                        Some(pc) => {
+                            matches!(pc.kind, PieceKind::Pawn)
+                                && ((side_idx == 0 && pc.side == Side::White)
+                                    || (side_idx == 1 && pc.side == Side::Black))
+                        }
+                        None => false,
+                    };
+                    if !pawn_here {
+                        missing += 1;
+                    }
+                }
+                s += if side_idx == 0 {
+                    (p.king_shield_missing as i32) * missing
+                } else {
+                    -(p.king_shield_missing as i32) * missing
+                };
+            }
+        }
+    }
+
+    let out = if b.stm == Side::White { s } else { -s };
+    out as i16
+}
+
+#[inline]
+fn file_of(sq: u8) -> usize {
+    (sq as usize) & 7
+}
+
+#[inline]
+fn rank_of(sq: u8) -> usize {
+    (sq as usize) >> 3
 }
