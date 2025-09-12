@@ -1,0 +1,43 @@
+{
+  "piece_val": [
+    100,
+    320,
+    330,
+    500,
+    900,
+    0
+  ],
+  "pst_scale": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "bishop_pair": 30,
+  "rook_open_file": 15,
+  "rook_semi_open_file": 7,
+  "isolated_pawn": -8,
+  "doubled_pawn": -12,
+  "passed_pawn": [
+    0,
+    0,
+    10,
+    20,
+    35,
+    60,
+    90,
+    0
+  ],
+  "king_shield_missing": -12,
+  "mg_weight": 192,
+  "eg_weight": 64,
+  "mobility_knight": 2,
+  "mobility_bishop": 3,
+  "mobility_rook": 2,
+  "mobility_queen": 1,
+  "connected_passers": 20,
+  "rook_behind_passer": 15,
+  "king_ring_penalty": 2
+}

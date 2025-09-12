@@ -1,0 +1,38 @@
+
+[package]
+name = "hoplite"
+version = "0.1.0"
+edition = "2021"
+description = "Hoplite: a Rust chess engine scaffold with UCI, legal movegen (basic), alpha-beta, and TT stubs."
+license = "MIT"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+parking_lot = "0.12"
+rand = "0.8"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lazy_static = "1"
+num_cpus = "1"
+indicatif = { version = "0.17", features = ["rayon"] }
+
+
+[lib]
+name = "hoplite"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hoplite"
+path = "src/main.rs"
+
+[[bin]]
+name = "tune"
+path = "src/bin/tune.rs"
