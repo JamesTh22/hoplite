@@ -24,6 +24,12 @@ lazy_static = "1"
 num_cpus = "1"
 indicatif = { version = "0.17", features = ["rayon"] }
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "perft"
+harness = false
 
 [lib]
 name = "hoplite"
