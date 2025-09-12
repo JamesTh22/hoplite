@@ -1,7 +1,7 @@
 use crate::board::Board;
 use crate::types::{sq, Move, PieceKind, Side};
 
-mod movecache;
+pub mod movecache;
 use lazy_static::lazy_static;
 
 const ROOK_DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];

@@ -265,17 +265,6 @@ impl Search {
         allocated
     }
     
-    fn king_square(b: &Board, side: Side) -> u8 {
-        for i in 0..64u8 {
-            if let Some(pc) = b.piece_at(i) {
-                if pc.side == side && matches!(pc.kind, PieceKind::King) {
-                    return i;
-                }
-            }
-        }
-        32 // Default to center if not found (shouldn't happen)
-    }
-
     pub fn bestmove_time(&mut self, b: &mut Board, time_ms: u128) -> Move {
         let mut history_keys: Vec<u64> = vec![b.key];
         self.nodes = 0;
@@ -1581,6 +1570,18 @@ fn eval(b: &Board) -> i16 {
         -blended
     };
     out as i16
+}
+
+// Helper function to find king's square for a given side
+fn king_square(b: &Board, side: Side) -> u8 {
+    for i in 0..64u8 {
+        if let Some(pc) = b.piece_at(i) {
+            if pc.side == side && matches!(pc.kind, PieceKind::King) {
+                return i;
+            }
+        }
+    }
+    32 // Default to center if not found (shouldn't happen)
 }
 
 #[inline]
