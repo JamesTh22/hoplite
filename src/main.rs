@@ -3,6 +3,7 @@ mod uci;
 mod board;
 mod movegen;
 mod search;
+mod eval;
 mod zobrist;
 mod tt;
 mod params;
