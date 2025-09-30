@@ -1,6 +1,6 @@
 use crate::board::Board;
+use crate::eval::{default_evaluator, EvalState, Evaluator};
 use crate::movegen::{legal_moves, square_attacked};
-use crate::eval::{Evaluator, default_evaluator};
 use crate::tt::{Bound, Entry, TT};
 use crate::types::{Move, PieceKind, Side};
 use parking_lot::Mutex;
@@ -66,9 +66,11 @@ pub struct Search {
 impl Search {
     // Helper method to check if last move was a capture
     fn last_was_capture(&self, history: &[u64]) -> bool {
-        if history.len() < 2 { return false; }
+        if history.len() < 2 {
+            return false;
+        }
         // If Zobrist hash changed by more than a move and side-to-move, likely a capture
-        let xor = history[history.len()-1] ^ history[history.len()-2];
+        let xor = history[history.len() - 1] ^ history[history.len() - 2];
         xor.count_ones() > 2
     }
 
@@ -100,6 +102,10 @@ impl Search {
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads)
             .build_global();
+    }
+
+    pub fn set_evaluator(&mut self, evaluator: Arc<dyn Evaluator>) {
+        self.evaluator = evaluator;
     }
 
     #[inline]
@@ -137,23 +143,31 @@ impl Search {
     // Depth-limited
     pub fn bestmove(&mut self, b: &mut Board, depth: i32) -> Move {
         let mut history_keys: Vec<u64> = vec![b.key];
+        let mut eval_state = self.evaluator.init_state(b);
         self.nodes = 0;
         self.stop.store(false, Ordering::Relaxed);
         self.deadline = None;
         let mut best = Move::default();
         let mut last_score: i16 = 0;
-        let mut stable_count = 0;  // Track how many times the best move remains stable
+        let mut stable_count = 0; // Track how many times the best move remains stable
         let start = Instant::now();
 
         for d in 1..=depth {
-            let pvs = self.search_root(b, d, &mut history_keys, last_score, self.multipv);
+            let pvs = self.search_root(
+                b,
+                d,
+                &mut history_keys,
+                last_score,
+                self.multipv,
+                &mut eval_state,
+            );
             if pvs.is_empty() {
                 break;
             }
             let new_score = pvs[0].1;
             let new_best = pvs[0].0[0];
-            
-            // Check if the best move is stable across iterations 
+
+            // Check if the best move is stable across iterations
             if d > 1 {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
@@ -165,7 +179,7 @@ impl Search {
                     stable_count = 0;
                 }
             }
-            
+
             last_score = new_score;
             best = new_best;
             let elapsed = start.elapsed().as_millis();
@@ -224,71 +238,81 @@ impl Search {
 
         // Estimate position complexity (0-100)
         let mut complexity = 0;
-        
+
         // More pieces = more complex
         complexity += (total_pieces * 2).min(30);
-        
+
         // Check for tactical elements
         let moves = legal_moves(b);
         for mv in moves.iter() {
-            if b.piece_at(mv.to).is_some() { // Captures available
+            if b.piece_at(mv.to).is_some() {
+                // Captures available
                 complexity += 5;
             }
             let u = b.make_move(*mv);
-            if b.in_check(b.stm) { // Checks available
+            if b.in_check(b.stm) {
+                // Checks available
                 complexity += 10;
             }
             b.unmake_move(*mv, u);
         }
-        
+
         // Kings under attack need more time
         if square_attacked(b, king_square(b, b.stm), b.stm.flip()) {
             complexity += 20;
         }
-        
+
         complexity = complexity.min(100);
 
         // Adjust time based on phase and complexity
         let mut allocated = total_time_ms;
-        
+
         // Use more time in complex middlegame positions
         if phase > 64 && phase < 192 {
             allocated = allocated * (100 + complexity as u128) / 100;
         }
-        
+
         // Use less time in simple endgames
         if phase <= 64 {
             allocated = allocated * 70 / 100;
         }
-        
+
         // Ensure reasonable bounds
-        allocated = allocated.clamp(total_time_ms/10, total_time_ms*2);
-        
+        allocated = allocated.clamp(total_time_ms / 10, total_time_ms * 2);
+
         allocated
     }
-    
+
     pub fn bestmove_time(&mut self, b: &mut Board, time_ms: u128) -> Move {
         let mut history_keys: Vec<u64> = vec![b.key];
+        let mut eval_state = self.evaluator.init_state(b);
         self.nodes = 0;
         self.stop.store(false, Ordering::Relaxed);
-        
+
         // Get dynamically allocated time based on position
         let allocated_time = self.allocate_time(time_ms, b);
         self.deadline = Some(Instant::now() + Duration::from_millis(allocated_time as u64));
-        
+
         let mut best = Move::default();
         let mut last_score: i16 = 0;
         let mut stable_count = 0; // Track stability
         let start = Instant::now();
 
         for d in 1..=64 {
-            let pvs = self.search_root(b, d, &mut history_keys, last_score, self.multipv);
+            let pvs = self.search_root(
+                b,
+                d,
+                &mut history_keys,
+                last_score,
+                self.multipv,
+                &mut eval_state,
+            );
             if pvs.is_empty() {
                 break;
             }
             let new_score = pvs[0].1;
             let new_best = pvs[0].0[0];
-            
+
             // Check if the best move is stable across iterations
             if d > 1 {
                 if new_best.from == best.from && new_best.to == best.to {
@@ -301,7 +325,7 @@ impl Search {
                     stable_count = 0;
                 }
             }
-            
+
             last_score = new_score;
             best = new_best;
             let elapsed = start.elapsed().as_millis();
@@ -348,6 +372,7 @@ impl Search {
     // Infinite search until stop flag is set
     pub fn bestmove_infinite(&mut self, b: &mut Board) -> Move {
         let mut history_keys: Vec<u64> = vec![b.key];
+        let mut eval_state = self.evaluator.init_state(b);
         self.nodes = 0;
         self.stop.store(false, Ordering::Relaxed);
         self.deadline = None;
@@ -357,13 +382,20 @@ impl Search {
         let start = Instant::now();
 
         for d in 1..=64 {
-            let pvs = self.search_root(b, d, &mut history_keys, last_score, self.multipv);
+            let pvs = self.search_root(
+                b,
+                d,
+                &mut history_keys,
+                last_score,
+                self.multipv,
+                &mut eval_state,
+            );
             if pvs.is_empty() {
                 break;
             }
             let new_score = pvs[0].1;
             let new_best = pvs[0].0[0];
-            
+
             // Check if the best move is stable across iterations
             if d > 1 {
                 if new_best.from == best.from && new_best.to == best.to {
@@ -376,7 +408,7 @@ impl Search {
                     stable_count = 0;
                 }
             }
-            
+
             last_score = new_score;
             best = new_best;
             let elapsed = start.elapsed().as_millis();
@@ -420,9 +452,10 @@ impl Search {
         history_keys: &mut Vec<u64>,
         prev_score: i16,
         multipv: usize,
+        eval_state: &mut EvalState,
     ) -> Vec<(Vec<Move>, i16)> {
         const ASPIRATION_WINDOW: i16 = 50; // Initial window size
-        const ASPIRATION_DELTA: i16 = 25;  // Window growth increment
+        const ASPIRATION_DELTA: i16 = 25; // Window growth increment
         let moves = legal_moves(b);
         if moves.is_empty() {
             return Vec::new();
@@ -440,8 +473,10 @@ impl Search {
                 .map(|(_, mv)| {
                     let mut s = base.clone();
                     let mut bb = base_board.clone();
+                    let mut state = s.evaluator.init_state(&bb);
                     let is_capture = bb.piece_at(mv.to).is_some();
-                    let _u = bb.make_move(*mv);
+                    let undo = bb.make_move(*mv);
+                    s.evaluator.push_state(&bb, &mut state, *mv, &undo);
                     let gave_check = bb.in_check(bb.stm);
                     let mut new_depth = depth - 1;
                     if gave_check {
@@ -466,7 +501,10 @@ impl Search {
                         1,
                         false,
                         &mut hk,
+                        &mut state,
                     );
+                    s.evaluator.pop_state(&mut state);
+                    bb.unmake_move(*mv, undo);
                     (*mv, sc, s.nodes)
                 })
                 .collect();
@@ -502,24 +540,33 @@ impl Search {
                     break;
                 }
                 let u = b.make_move(mv);
-            let is_capture = b.piece_at(mv.to).is_some();
-            let mut new_depth = depth - 1;
+                self.evaluator.push_state(b, eval_state, mv, &u);
+                let is_capture = b.piece_at(mv.to).is_some();
+                let mut new_depth = depth - 1;
 
-            // Enhanced positional extensions
-            let gave_check = b.in_check(b.stm);
-            let is_pawn_push = if let Some(p) = b.piece_at(mv.from) {
-                matches!(p.kind, PieceKind::Pawn) && 
-                (mv.to / 8 == 6 || mv.to / 8 == 1) // 7th/2nd rank
-            } else { false };
-            let is_recapture = is_capture && self.last_was_capture(history_keys);
-            
-            // Extend search in critical positions
-            if gave_check { new_depth += 1; }
-            if is_pawn_push { new_depth += 1; }
-            if is_recapture { new_depth += 1; }
-            
-            // But limit total extension
-            new_depth = new_depth.min(depth + 2);                // LMR
+                // Enhanced positional extensions
+                let gave_check = b.in_check(b.stm);
+                let is_pawn_push = if let Some(p) = b.piece_at(mv.from) {
+                    matches!(p.kind, PieceKind::Pawn) && (mv.to / 8 == 6 || mv.to / 8 == 1)
+                // 7th/2nd rank
+                } else {
+                    false
+                };
+                let is_recapture = is_capture && self.last_was_capture(history_keys);
+
+                // Extend search in critical positions
+                if gave_check {
+                    new_depth += 1;
+                }
+                if is_pawn_push {
+                    new_depth += 1;
+                }
+                if is_recapture {
+                    new_depth += 1;
+                }
+
+                // But limit total extension
+                new_depth = new_depth.min(depth + 2); // LMR
                 if depth >= 3 && !is_capture && !gave_check {
                     let d = depth as i32;
                     let mut r = 1 + (d / 3);
@@ -530,7 +577,17 @@ impl Search {
                         new_depth -= r;
                     }
                 }
-                let sc = -self.alphabeta(b, new_depth, -beta, -alpha, 1, false, history_keys);
+                let sc = -self.alphabeta(
+                    b,
+                    new_depth,
+                    -beta,
+                    -alpha,
+                    1,
+                    false,
+                    history_keys,
+                    eval_state,
+                );
+                self.evaluator.pop_state(eval_state);
                 b.unmake_move(mv, u);
                 results.push((mv, sc));
                 if sc > alpha {
@@ -573,6 +630,7 @@ impl Search {
         ply: usize,
         _in_null: bool,
         history_keys: &mut Vec<u64>,
+        eval_state: &mut EvalState,
     ) -> i16 {
         self.nodes += 1;
         if (self.nodes & 0x1FFF) == 0 && self.time_up() {
@@ -587,23 +645,23 @@ impl Search {
 
         // Static eval pruning
         if depth <= 0 {
-            return self.qsearch(b, alpha, beta, history_keys);
+            return self.qsearch(b, alpha, beta, history_keys, eval_state);
         }
 
         // Eval pruning / futility pruning
         if !in_check && depth <= 3 {
-            let eval = self.evaluator.eval(b);
-            
+            let eval = self.evaluator.eval(b, eval_state);
+
             // Reverse futility pruning
             if depth <= 3 && eval >= beta + futility_margin(depth) {
                 return eval;
             }
-            
+
             // Futility pruning
             if depth <= 2 {
                 let margin = futility_margin(depth);
                 if eval + margin <= alpha {
-                    let qscore = self.qsearch(b, alpha, beta, history_keys);
+                    let qscore = self.qsearch(b, alpha, beta, history_keys, eval_state);
                     if qscore <= alpha {
                         return qscore;
                     }
@@ -616,15 +674,24 @@ impl Search {
             let tt = self.tt.lock();
             tt.probe(b.key)
         };
-        
+
         // Internal Iterative Deepening when we have no TT move
         if depth >= 4 && !tt_entry.is_some() {
             let iid_depth = depth - 2;
-            self.alphabeta(b, iid_depth, alpha, beta, ply, false, history_keys);
+            self.alphabeta(
+                b,
+                iid_depth,
+                alpha,
+                beta,
+                ply,
+                false,
+                history_keys,
+                eval_state,
+            );
             let tt = self.tt.lock();
             tt_entry = tt.probe(b.key);
         }
-        
+
         // Use TT entry if we found one
         if let Some(e) = tt_entry {
             match e.bound {
@@ -661,6 +728,7 @@ impl Search {
                 ply + 1,
                 true,
                 history_keys,
+                eval_state,
             );
             history_keys.pop();
             b.stm = saved_stm;
@@ -687,6 +755,7 @@ impl Search {
 
         for (idx, (_, mv)) in scored.into_iter().enumerate() {
             let u = b.make_move(mv);
+            self.evaluator.push_state(b, eval_state, mv, &u);
             let is_capture = b.piece_at(mv.to).is_some();
             let mut new_depth = depth - 1;
             let gave_check = b.in_check(b.stm);
@@ -697,7 +766,7 @@ impl Search {
             if depth >= 3 && !is_capture && !gave_check {
                 let d = depth as i32;
                 let m = (idx as i32) + 1;
-                
+
                 // Dynamic base reduction
                 let mut r = if idx >= 3 {
                     // More aggressive reduction for later moves
@@ -712,7 +781,7 @@ impl Search {
                     // Light reduction for early moves
                     1 + (d / 4)
                 };
-                
+
                 // Adjust based on move characteristics
                 if let Some(p) = b.piece_at(mv.from) {
                     match p.kind {
@@ -723,33 +792,44 @@ impl Search {
                         PieceKind::Pawn => {
                             // Less reduction for pawn moves to 6th/7th rank
                             let to_rank = mv.to / 8;
-                            if (p.side == Side::White && to_rank >= 5) ||
-                               (p.side == Side::Black && to_rank <= 2) {
+                            if (p.side == Side::White && to_rank >= 5)
+                                || (p.side == Side::Black && to_rank <= 2)
+                            {
                                 r = r.saturating_sub(1);
                             }
                         }
                         _ => {}
                     }
                 }
-                
+
                 // History-based adjustments
                 let side_idx = if b.stm == Side::White { 0 } else { 1 };
                 let hist_idx = (mv.from as usize) * 64 + (mv.to as usize);
                 if self.history[side_idx][hist_idx] > 8000 {
                     r = r.saturating_sub(1);
                 }
-                
+
                 // Clamp reduction
                 r = r.clamp(1, d - 1);
                 new_depth -= r;
-                
+
                 // Ensure minimum search depth
                 new_depth = new_depth.max(1);
             }
 
             history_keys.push(b.key);
-            let sc = -self.alphabeta(b, new_depth, -beta, -alpha, ply + 1, false, history_keys);
+            let sc = -self.alphabeta(
+                b,
+                new_depth,
+                -beta,
+                -alpha,
+                ply + 1,
+                false,
+                history_keys,
+                eval_state,
+            );
             history_keys.pop();
+            self.evaluator.pop_state(eval_state);
             b.unmake_move(mv, u);
 
             if sc >= beta {
@@ -812,6 +892,7 @@ impl Search {
         mut alpha: i16,
         beta: i16,
         history_keys: &mut Vec<u64>,
+        eval_state: &mut EvalState,
     ) -> i16 {
         self.nodes += 1;
         if (self.nodes & 0x1FFF) == 0 && self.time_up() {
@@ -822,17 +903,17 @@ impl Search {
             return 0;
         }
 
-        let stand_pat = self.evaluator.eval(b);
+        let stand_pat = self.evaluator.eval(b, eval_state);
         if stand_pat >= beta {
             return beta;
         }
-        
+
         // Delta pruning - don't look for captures if we're too far behind
         const DELTA_MARGIN: i16 = 900; // Queen value
         if stand_pat + DELTA_MARGIN < alpha {
             return alpha;
         }
-        
+
         if stand_pat > alpha {
             alpha = stand_pat;
         }
@@ -841,16 +922,17 @@ impl Search {
         let mut captures: Vec<(i32, Move)> = Vec::new();
         let mut checks: Vec<Move> = Vec::new();
         let mut dangerous_moves: Vec<Move> = Vec::new(); // For potential threats
-        
+
         for mv in moves {
             if b.piece_at(mv.to).is_some() {
                 let see_score = see(b, mv.from, mv.to);
-                if see_score >= 0 { // Only consider positive or equal captures
+                if see_score >= 0 {
+                    // Only consider positive or equal captures
                     captures.push((score_capture(b, mv) + see_score as i32, mv));
                 }
             } else {
                 let u = b.make_move(mv);
-                
+
                 // Check for discovered attacks on king or valuable pieces
                 if b.in_check(b.stm) {
                     checks.push(mv);
@@ -858,7 +940,9 @@ impl Search {
                     // Look for moves that attack valuable pieces
                     for sq in 0..64u8 {
                         if let Some(pc) = b.piece_at(sq) {
-                            if pc.side == b.stm && matches!(pc.kind, PieceKind::Queen | PieceKind::Rook) {
+                            if pc.side == b.stm
+                                && matches!(pc.kind, PieceKind::Queen | PieceKind::Rook)
+                            {
                                 if square_attacked(b, sq, b.stm.flip()) {
                                     dangerous_moves.push(mv);
                                     break;
@@ -867,7 +951,7 @@ impl Search {
                         }
                     }
                 }
-                
+
                 b.unmake_move(mv, u);
             }
         }
@@ -878,7 +962,9 @@ impl Search {
                 continue;
             }
             let u = b.make_move(mv);
-            let score = -self.qsearch(b, -beta, -alpha, history_keys);
+            self.evaluator.push_state(b, eval_state, mv, &u);
+            let score = -self.qsearch(b, -beta, -alpha, history_keys, eval_state);
+            self.evaluator.pop_state(eval_state);
             b.unmake_move(mv, u);
             if score >= beta {
                 return beta;
@@ -895,7 +981,9 @@ impl Search {
             }
             tried += 1;
             let u = b.make_move(mv);
-            let score = -self.qsearch(b, -beta, -alpha, history_keys);
+            self.evaluator.push_state(b, eval_state, mv, &u);
+            let score = -self.qsearch(b, -beta, -alpha, history_keys, eval_state);
+            self.evaluator.pop_state(eval_state);
             b.unmake_move(mv, u);
             if score >= beta {
                 return beta;
@@ -928,25 +1016,25 @@ impl Search {
                 }
             }
         }
-        
+
         for &mv in moves {
             let mut s: i32 = 0;
-            
+
             // TT move gets highest priority
             if let Some(tmv) = tt_move {
                 if tmv.from == mv.from && tmv.to == mv.to && tmv.promo == mv.promo {
                     s += 2_000_000; // Higher bonus for TT moves
                 }
             }
-            
+
             let side_idx = if b.stm == Side::White { 0 } else { 1 };
-            
+
             // Captures scored by MVV/LVA
             if let Some(victim) = b.piece_at(mv.to) {
                 if see(b, mv.from, mv.to) >= 0 {
                     let see_score = see(b, mv.from, mv.to);
                     s += 1_000_000 + see_score + score_capture(b, mv);
-                    
+
                     // Bonus for capturing with lesser pieces
                     if let Some(attacker) = b.piece_at(mv.from) {
                         if Self::piece_value(attacker.kind) < Self::piece_value(victim.kind) {
@@ -959,14 +1047,19 @@ impl Search {
             } else {
                 // Enhanced scoring for non-captures
                 let u = b.make_move(mv);
-                
+
                 // Check detection with bonus scaling
                 if b.in_check(b.stm) {
                     s += 500_000; // Base bonus for checks
-                    
+
                     // Additional bonus for discovered checks
                     let from_pc = b.piece_at(mv.from);
-                    if from_pc.map_or(false, |p| !matches!(p.kind, PieceKind::Queen | PieceKind::Rook | PieceKind::Bishop)) {
+                    if from_pc.map_or(false, |p| {
+                        !matches!(
+                            p.kind,
+                            PieceKind::Queen | PieceKind::Rook | PieceKind::Bishop
+                        )
+                    }) {
                         s += 100_000; // Extra bonus for discovered checks
                     }
                 }
@@ -980,15 +1073,16 @@ impl Search {
                     let king_dist = file_dist.max(rank_dist);
                     s += (8 - king_dist) * 2000;
                 }
-                
+
                 // Control of critical squares
-                let is_central = (mv.to % 8 >= 2 && mv.to % 8 <= 5) && (mv.to / 8 >= 2 && mv.to / 8 <= 5);
+                let is_central =
+                    (mv.to % 8 >= 2 && mv.to % 8 <= 5) && (mv.to / 8 >= 2 && mv.to / 8 <= 5);
                 if is_central {
                     s += 3000;
                 }
-                
+
                 b.unmake_move(mv, u);
-                
+
                 // Killers get good bonus but below good captures
                 if self.killers[ply][0].from == mv.from && self.killers[ply][0].to == mv.to {
                     s += 100_000;
@@ -996,11 +1090,11 @@ impl Search {
                 if self.killers[ply][1].from == mv.from && self.killers[ply][1].to == mv.to {
                     s += 80_000;
                 }
-                
+
                 // History score
                 let idx = (mv.from as usize) * 64 + (mv.to as usize);
                 s += self.history[side_idx][idx];
-                
+
                 // Positional bonuses
                 if let Some(p) = b.piece_at(mv.from) {
                     match p.kind {
@@ -1079,11 +1173,11 @@ fn see(b: &Board, from: u8, to: u8) -> i32 {
         // to avoid overvaluing captures
         match k {
             Pawn => 95,    // Conservative pawn value
-            Knight => 310,  // Knights slightly undervalued in SEE
-            Bishop => 320,  // Bishops slightly undervalued in SEE
-            Rook => 475,    // Rooks undervalued to prevent bad rook trades
-            Queen => 875,   // Queens slightly undervalued to prevent bad queen trades
-            King => 9900,   // High but not infinite to detect king captures
+            Knight => 310, // Knights slightly undervalued in SEE
+            Bishop => 320, // Bishops slightly undervalued in SEE
+            Rook => 475,   // Rooks undervalued to prevent bad rook trades
+            Queen => 875,  // Queens slightly undervalued to prevent bad queen trades
+            King => 9900,  // High but not infinite to detect king captures
         }
     };
     let mut occ = b.pieces;
@@ -1236,12 +1330,12 @@ fn rank_of(sq: u8) -> usize {
 #[inline]
 fn futility_margin(depth: i32) -> i16 {
     let base = match depth {
-        1 => 125,  // Slightly higher than pawn value
-        2 => 350,  // Higher than minor piece
-        3 => 550,  // Higher than rook value
+        1 => 125, // Slightly higher than pawn value
+        2 => 350, // Higher than minor piece
+        3 => 550, // Higher than rook value
         _ => 0,
     };
-    
+
     // Scale margin up in late game positions
     let phase_bonus = if depth > 1 { depth as i16 * 25 } else { 0 };
     base + phase_bonus

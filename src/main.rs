@@ -4,6 +4,7 @@ mod board;
 mod movegen;
 mod search;
 mod eval;
+mod nnue;
 mod zobrist;
 mod tt;
 mod params;
