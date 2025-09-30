@@ -33,6 +33,23 @@ isready
 ```
 The engine also tries to auto-load `params.json` on startup if present.
 
+## Loading an NNUE network
+Hoplite can load a Stockfish-compatible `.nnue` network at runtime. Point the
+`EvalFile` UCI option to the desired network file:
+
+```
+setoption name EvalFile value /path/to/nn-xxxx.nnue
+isready
+```
+
+Use an empty value to fall back to the built-in PSQT evaluator:
+
+```
+setoption name EvalFile value
+```
+
+The engine prints an `info string` with the result of the load attempt.
+
 ## Tips
 - For early runs, prefer `--movetime 15–30`. For refinement, `40–60` ms.
 - If you want to push beyond piece values + PST scales, add more fields to `src/params.rs` and use them in `eval()` (passed pawns, bishop pair, mobility, king safety, etc.). The tuner will optimize them automatically.

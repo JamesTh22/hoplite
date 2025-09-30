@@ -1,9 +1,11 @@
 use crate::board::Board;
+use crate::eval::{default_evaluator, nnue_evaluator};
+use crate::nnue;
 use crate::search::Search;
 use crate::types::Move;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, Arc};
 
 pub struct Uci {
     board: Board,
@@ -49,6 +51,7 @@ impl Uci {
                     "option name ParamsFile type string default params.json"
                 )
                 .unwrap();
+                writeln!(out, "option name EvalFile type string default").unwrap();
                 writeln!(out, "uciok").unwrap();
             } else if line.starts_with("setoption") {
                 // setoption name <Name> value <Val>
@@ -102,6 +105,30 @@ impl Uci {
                             let map: HashMap<u128, (u32, u32)> =
                                 serde_json::from_str(&s).unwrap_or_default();
                             self.search.exp_table = map;
+                        }
+                    }
+                } else if name.eq_ignore_ascii_case("EvalFile") {
+                    let trimmed = val.trim();
+                    if trimmed.is_empty() {
+                        self.search.set_evaluator(default_evaluator());
+                        writeln!(out, "info string switched to PSQT evaluator").unwrap();
+                    } else {
+                        match nnue::load_nnue(trimmed) {
+                            Ok(net) => {
+                                let net = Arc::new(net);
+                                let summary = net.summary();
+                                self.search.set_evaluator(nnue_evaluator(net));
+                                writeln!(out, "info string loaded NNUE {}", summary).unwrap();
+                            }
+                            Err(e) => {
+                                writeln!(
+                                    out,
+                                    "info string failed to load NNUE '{}': {}",
+                                    trimmed, e
+                                )
+                                .unwrap();
+                                self.search.set_evaluator(default_evaluator());
+                            }
                         }
                     }
                 }
