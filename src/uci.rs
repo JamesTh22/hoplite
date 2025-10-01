@@ -4,13 +4,17 @@ use crate::nnue;
 use crate::search::Search;
 use crate::types::Move;
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{atomic::Ordering, Arc};
 
 pub struct Uci {
     board: Board,
     search: Search,
     search_thread: Option<std::thread::JoinHandle<()>>,
+    eval_dir: PathBuf,
+    auto_load_attempted: bool,
 }
 
 impl Uci {
@@ -19,7 +23,131 @@ impl Uci {
             board: Board::new_start(),
             search: Search::new(),
             search_thread: None,
+            eval_dir: PathBuf::from("NNUE"),
+            auto_load_attempted: false,
         }
+    }
+
+    fn ensure_eval_dir(&self) -> io::Result<()> {
+        if self.eval_dir.as_os_str().is_empty() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.eval_dir)
+    }
+
+    fn nnue_files(&self) -> io::Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        if self.eval_dir.as_os_str().is_empty() {
+            return Ok(files);
+        }
+        let entries = match fs::read_dir(&self.eval_dir) {
+            Ok(iter) => iter,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                if ext.eq_ignore_ascii_case("nnue") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort_by(|a, b| {
+            let an = a
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let bn = b
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            an.cmp(&bn)
+        });
+        Ok(files)
+    }
+
+    fn resolve_nnue_path(&self, value: &str) -> PathBuf {
+        let candidate = Path::new(value);
+        if candidate.is_absolute() || value.contains('/') || value.contains("\\") {
+            candidate.to_path_buf()
+        } else {
+            self.eval_dir.join(candidate)
+        }
+    }
+
+    fn load_nnue_from_path(&mut self, path: &Path) -> Result<String, String> {
+        match nnue::load_nnue(path) {
+            Ok(net) => {
+                let summary = net.summary();
+                let net = Arc::new(net);
+                self.search.set_evaluator(nnue_evaluator(net));
+                Ok(summary)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn auto_load_default_nnue(&mut self) -> Vec<String> {
+        if self.auto_load_attempted {
+            return Vec::new();
+        }
+        self.auto_load_attempted = true;
+        let mut messages = Vec::new();
+        if let Err(e) = self.ensure_eval_dir() {
+            messages.push(format!(
+                "info string failed to prepare NNUE directory `{}`: {}",
+                self.eval_dir.display(),
+                e
+            ));
+            self.auto_load_attempted = false;
+            return messages;
+        }
+        let files = match self.nnue_files() {
+            Ok(list) => list,
+            Err(e) => {
+                messages.push(format!(
+                    "info string failed to enumerate NNUE directory `{}`: {}",
+                    self.eval_dir.display(),
+                    e
+                ));
+                self.auto_load_attempted = false;
+                return messages;
+            }
+        };
+        if files.is_empty() {
+            messages.push(format!(
+                "info string no NNUE networks found in `{}`",
+                self.eval_dir.display()
+            ));
+            self.auto_load_attempted = false;
+            return messages;
+        }
+        let path = &files[0];
+        match self.load_nnue_from_path(path) {
+            Ok(summary) => messages.push(format!(
+                "info string auto-loaded NNUE `{}` {}",
+                path.display(),
+                summary
+            )),
+            Err(e) => {
+                messages.push(format!(
+                    "info string failed to auto-load NNUE `{}`: {}",
+                    path.display(),
+                    e
+                ));
+                self.auto_load_attempted = false;
+            }
+        }
+        messages
     }
 
     pub fn mainloop(&mut self) {
@@ -31,7 +159,11 @@ impl Uci {
             if line == "uci" {
                 writeln!(out, "id name Hoplite 0.1.0").unwrap();
                 writeln!(out, "id author you").unwrap();
-                writeln!(out, "option name Hash type spin default 64 min 1 max 4096").unwrap();
+                writeln!(
+                    out,
+                    "option name Hash type spin default 256 min 1 max 16384"
+                )
+                .unwrap();
                 writeln!(out, "option name Threads type spin default 1 min 1 max 64").unwrap();
                 writeln!(
                     out,
@@ -52,6 +184,48 @@ impl Uci {
                 )
                 .unwrap();
                 writeln!(out, "option name EvalFile type string default").unwrap();
+                writeln!(out, "option name EvalDirectory type string default NNUE").unwrap();
+                writeln!(
+                    out,
+                    "option name MinDepth type spin default 20 min 1 max 64"
+                )
+                .unwrap();
+                for msg in self.auto_load_default_nnue() {
+                    writeln!(out, "{}", msg).unwrap();
+                }
+                match self.nnue_files() {
+                    Ok(files) if !files.is_empty() => {
+                        let listing = files
+                            .iter()
+                            .filter_map(|p| p.file_name().and_then(|s| s.to_str()))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        writeln!(
+                            out,
+                            "info string NNUE files in `{}`: {}",
+                            self.eval_dir.display(),
+                            listing
+                        )
+                        .unwrap();
+                    }
+                    Ok(_) => {
+                        writeln!(
+                            out,
+                            "info string drop NNUE networks into `{}` to enable NNUE",
+                            self.eval_dir.display()
+                        )
+                        .unwrap();
+                    }
+                    Err(e) => {
+                        writeln!(
+                            out,
+                            "info string failed to inspect NNUE directory `{}`: {}",
+                            self.eval_dir.display(),
+                            e
+                        )
+                        .unwrap();
+                    }
+                }
                 writeln!(out, "uciok").unwrap();
             } else if line.starts_with("setoption") {
                 // setoption name <Name> value <Val>
@@ -113,23 +287,83 @@ impl Uci {
                         self.search.set_evaluator(default_evaluator());
                         writeln!(out, "info string switched to PSQT evaluator").unwrap();
                     } else {
-                        match nnue::load_nnue(trimmed) {
-                            Ok(net) => {
-                                let net = Arc::new(net);
-                                let summary = net.summary();
-                                self.search.set_evaluator(nnue_evaluator(net));
-                                writeln!(out, "info string loaded NNUE {}", summary).unwrap();
+                        let path = self.resolve_nnue_path(trimmed);
+                        match self.load_nnue_from_path(&path) {
+                            Ok(summary) => {
+                                writeln!(
+                                    out,
+                                    "info string loaded NNUE `{}` {}",
+                                    path.display(),
+                                    summary
+                                )
+                                .unwrap();
+                                self.auto_load_attempted = true;
                             }
                             Err(e) => {
                                 writeln!(
                                     out,
-                                    "info string failed to load NNUE '{}': {}",
-                                    trimmed, e
+                                    "info string failed to load NNUE `{}`: {}",
+                                    path.display(),
+                                    e
                                 )
                                 .unwrap();
                                 self.search.set_evaluator(default_evaluator());
                             }
                         }
+                    }
+                } else if name.eq_ignore_ascii_case("EvalDirectory") {
+                    let trimmed = val.trim();
+                    self.eval_dir = if trimmed.is_empty() {
+                        PathBuf::from("NNUE")
+                    } else {
+                        PathBuf::from(trimmed)
+                    };
+                    self.auto_load_attempted = false;
+                    for msg in self.auto_load_default_nnue() {
+                        writeln!(out, "{}", msg).unwrap();
+                    }
+                    match self.nnue_files() {
+                        Ok(files) if !files.is_empty() => {
+                            let listing = files
+                                .iter()
+                                .filter_map(|p| p.file_name().and_then(|s| s.to_str()))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            writeln!(
+                                out,
+                                "info string NNUE files in `{}`: {}",
+                                self.eval_dir.display(),
+                                listing
+                            )
+                            .unwrap();
+                        }
+                        Ok(_) => {
+                            writeln!(
+                                out,
+                                "info string drop NNUE networks into `{}` to enable NNUE",
+                                self.eval_dir.display()
+                            )
+                            .unwrap();
+                        }
+                        Err(e) => {
+                            writeln!(
+                                out,
+                                "info string failed to inspect NNUE directory `{}`: {}",
+                                self.eval_dir.display(),
+                                e
+                            )
+                            .unwrap();
+                        }
+                    }
+                } else if name.eq_ignore_ascii_case("MinDepth") {
+                    if let Ok(d) = val.trim().parse::<i32>() {
+                        self.search.set_min_depth(d);
+                        writeln!(
+                            out,
+                            "info string minimum search depth set to {}",
+                            self.search.min_depth
+                        )
+                        .unwrap();
                     }
                 }
             } else if line == "saveparams" {
@@ -298,7 +532,16 @@ impl Uci {
                     if let Some(mv) = multipv {
                         self.search.multipv = mv.max(1);
                     }
-                    let best = self.search.bestmove(&mut self.board, d);
+                    let target_depth = d.max(self.search.min_depth);
+                    if target_depth > d {
+                        writeln!(
+                            out,
+                            "info string depth {} raised to minimum {}",
+                            d, target_depth
+                        )
+                        .unwrap();
+                    }
+                    let best = self.search.bestmove(&mut self.board, target_depth);
                     self.search.multipv = prev;
                     let mv = if best.from == 0 && best.to == 0 {
                         "0000".to_string()

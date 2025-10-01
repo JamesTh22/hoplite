@@ -61,6 +61,8 @@ pub struct Search {
     pub killers: [[Move; 2]; MAX_PLY], // two killer moves per ply
     pub history: [[i32; 4096]; 2],     // side, from*64+to
     pub evaluator: Arc<dyn Evaluator + Send + Sync>,
+    pub min_depth: i32,
+    current_iter_depth: i32,
 }
 
 impl Search {
@@ -77,7 +79,7 @@ impl Search {
     pub fn new() -> Self {
         Self {
             nodes: 0,
-            tt: Arc::new(Mutex::new(TT::new(64))),
+            tt: Arc::new(Mutex::new(TT::new(256))),
             stop: Arc::new(AtomicBool::new(false)),
             threads: 1,
             deadline: None,
@@ -91,6 +93,8 @@ impl Search {
             killers: [[Move::default(); 2]; MAX_PLY],
             history: [[0; 4096]; 2],
             evaluator: default_evaluator(),
+            min_depth: 20,
+            current_iter_depth: 0,
         }
     }
     pub fn set_hash_mb(&mut self, mb: usize) {
@@ -108,10 +112,14 @@ impl Search {
         self.evaluator = evaluator;
     }
 
+    pub fn set_min_depth(&mut self, depth: i32) {
+        self.min_depth = depth.max(1);
+    }
+
     #[inline]
     fn time_up(&self) -> bool {
         if let Some(d) = self.deadline {
-            Instant::now() >= d
+            Instant::now() >= d && self.current_iter_depth >= self.min_depth
         } else {
             false
         }
@@ -152,7 +160,9 @@ impl Search {
         let mut stable_count = 0; // Track how many times the best move remains stable
         let start = Instant::now();
 
+        self.current_iter_depth = 0;
         for d in 1..=depth {
+            self.current_iter_depth = d;
             let pvs = self.search_root(
                 b,
                 d,
@@ -172,7 +182,7 @@ impl Search {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
                     // If move is stable for 2 iterations and we're past depth 6, return early
-                    if stable_count >= 2 && d >= 6 {
+                    if stable_count >= 2 && d >= 6 && d >= self.min_depth {
                         break;
                     }
                 } else {
@@ -213,6 +223,7 @@ impl Search {
                 break;
             }
         }
+        self.current_iter_depth = 0;
         best
     }
 
@@ -298,7 +309,9 @@ impl Search {
         let mut stable_count = 0; // Track stability
         let start = Instant::now();
 
+        self.current_iter_depth = 0;
         for d in 1..=64 {
+            self.current_iter_depth = d;
             let pvs = self.search_root(
                 b,
                 d,
@@ -318,7 +331,7 @@ impl Search {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
                     // If move is stable for 2 iterations and we're past depth 6, return early
-                    if stable_count >= 2 && d >= 6 {
+                    if stable_count >= 2 && d >= 6 && d >= self.min_depth {
                         break;
                     }
                 } else {
@@ -366,6 +379,7 @@ impl Search {
                 std::thread::sleep(deadline - now);
             }
         }
+        self.current_iter_depth = 0;
         best
     }
 
