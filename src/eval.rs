@@ -438,30 +438,21 @@ impl Evaluator for NnueEvaluator {
     }
 
     fn eval(&self, b: &Board, ctx: &mut EvalState) -> i16 {
-        match ctx.nnue_stack_mut() {
-            Some(stack) => {
-                if stack.is_empty() {
-                    stack.push(Accumulator::from_board(b));
-                }
-                if let Some(acc) = stack.last() {
-                    let nnue_score = self.network.evaluate(acc);
-                    if nnue_score != 0 {
-                        return nnue_score;
-                    }
-                }
+        if ctx.nnue_stack_mut().is_none() {
+            ctx.set_nnue_stack(vec![Accumulator::from_board(b)]);
+        }
+
+        if let Some(stack) = ctx.nnue_stack_mut() {
+            if stack.is_empty() {
+                stack.push(Accumulator::from_board(b));
             }
-            None => {
-                ctx.set_nnue_stack(vec![Accumulator::from_board(b)]);
-                if let Some(stack) = ctx.nnue_stack_mut() {
-                    if let Some(acc) = stack.last() {
-                        let nnue_score = self.network.evaluate(acc);
-                        if nnue_score != 0 {
-                            return nnue_score;
-                        }
-                    }
+            if let Some(acc) = stack.last_mut() {
+                if let Some(score) = self.network.evaluate(b, acc) {
+                    return score;
                 }
             }
         }
+
         self.fallback.eval(b, ctx)
     }
 

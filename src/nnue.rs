@@ -1,27 +1,29 @@
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use binread::BinRead;
+use nnue::stockfish::halfkp::{
+    scale_nn_to_centipawns, SfHalfKpFullModel, SfHalfKpModel, SfHalfKpState,
+};
+use nnue::{Color as NnueColor, Piece as NnuePiece, Square as NnueSquare};
 
 use crate::board::{Board, Undo};
-use crate::types::Move;
+use crate::types::{Move, PieceKind, Side};
 
-/// A minimal representation of a Stockfish-style NNUE network.
-///
-/// The implementation keeps the raw payload of the `.nnue` file together with
-/// the header metadata.  The engine does not attempt to interpret the network
-/// weights yet, but the metadata is validated so that obviously corrupt files
-/// are rejected.  This is sufficient to provide the higher-level incremental
-/// accumulator plumbing required by the search code.
-#[derive(Clone, Debug)]
+/// Representation of a Stockfish-style NNUE network backed by the `nnue`
+/// library.  The loader keeps track of the header metadata together with the
+/// parsed model so that the rest of the engine can evaluate positions without
+/// keeping any global mutable state.
+#[derive(Clone)]
 pub struct NnueNetwork {
     pub version: u32,
     pub network_hash: u32,
     pub architecture_hash: u32,
     pub description: String,
     pub path: Option<PathBuf>,
-    raw: Vec<u8>,
+    model: SfHalfKpModel,
 }
 
 impl NnueNetwork {
@@ -68,13 +70,17 @@ impl NnueNetwork {
             bail!("NNUE file is missing layer data");
         }
 
+        let mut cursor = Cursor::new(&data);
+        let full_model = SfHalfKpFullModel::read(&mut cursor)
+            .with_context(|| "failed to parse NNUE payload as a HalfKP network")?;
+
         Ok(Self {
             version,
             network_hash,
             architecture_hash,
             description,
             path,
-            raw: data,
+            model: full_model.model,
         })
     }
 
@@ -89,12 +95,35 @@ impl NnueNetwork {
         )
     }
 
-    /// Placeholder evaluation routine.  The NNUE weights are not interpreted
-    /// yet; instead we merely return `0` and rely on the PSQT fall-back to
-    /// supply the actual evaluation.  The accumulator plumbing still relies on
-    /// this method so we keep it available for future use.
-    pub fn evaluate(&self, _accumulator: &Accumulator) -> i16 {
-        0
+    pub fn evaluate(&self, board: &Board, acc: &mut Accumulator) -> Option<i16> {
+        if acc.key != board.key {
+            acc.key = board.key;
+            acc.value = None;
+        }
+
+        if let Some(score) = acc.value {
+            return Some(score);
+        }
+
+        let eval = self.forward(board)?;
+        acc.value = Some(eval);
+        Some(eval)
+    }
+
+    fn forward(&self, board: &Board) -> Option<i16> {
+        let (white_king_sq, black_king_sq) = find_kings(board)?;
+
+        let white_king = square_to_nnue(white_king_sq);
+        let black_king = square_to_nnue(black_king_sq);
+
+        let mut state = self.model.new_state(white_king, black_king);
+        populate_state(board, &mut state);
+
+        let stm = side_to_nnue(board.stm);
+        let raw = state.activate(stm)[0];
+        let centipawns = scale_nn_to_centipawns(raw);
+        let clamped = centipawns.clamp(-32000, 32000);
+        Some(clamped as i16)
     }
 }
 
@@ -102,19 +131,26 @@ impl NnueNetwork {
 /// intentionally conservative: we rebuild the accumulator from scratch whenever
 /// the board changes.  This keeps the API surface identical to an actual
 /// incremental update routine and allows the search to maintain a state stack
-/// without special casing.
+/// without special casing.  The accumulator also caches the most recent
+/// evaluation so that repeated probes of the same board avoid re-running the
+/// forward pass.
 #[derive(Clone, Debug, Default)]
 pub struct Accumulator {
     key: u64,
+    value: Option<i16>,
 }
 
 impl Accumulator {
     pub fn from_board(board: &Board) -> Self {
-        Self { key: board.key }
+        Self {
+            key: board.key,
+            value: None,
+        }
     }
 
     pub fn update(&mut self, board: &Board, _mv: Move, _undo: &Undo) {
-        *self = Self::from_board(board);
+        self.key = board.key;
+        self.value = None;
     }
 
     pub fn key(&self) -> u64 {
@@ -125,4 +161,60 @@ impl Accumulator {
 /// Convenience helper used in tests and UCI plumbing.
 pub fn load_nnue(path: impl AsRef<Path>) -> Result<NnueNetwork> {
     NnueNetwork::load_from_file(path)
+}
+
+fn find_kings(board: &Board) -> Option<(u8, u8)> {
+    let mut white = None;
+    let mut black = None;
+
+    for sq in 0..64u8 {
+        if let Some(piece) = board.piece_at(sq) {
+            match (piece.side, piece.kind) {
+                (Side::White, PieceKind::King) => white = Some(sq),
+                (Side::Black, PieceKind::King) => black = Some(sq),
+                _ => {}
+            }
+        }
+    }
+
+    match (white, black) {
+        (Some(w), Some(b)) => Some((w, b)),
+        _ => None,
+    }
+}
+
+fn populate_state(board: &Board, state: &mut SfHalfKpState<'_>) {
+    for sq in 0..64u8 {
+        if let Some(piece) = board.piece_at(sq) {
+            if let Some(nnue_piece) = piece_kind_to_nnue(piece.kind) {
+                let square = square_to_nnue(sq);
+                let piece_color = side_to_nnue(piece.side);
+                for color in NnueColor::ALL.iter().copied() {
+                    state.add(color, nnue_piece, piece_color, square);
+                }
+            }
+        }
+    }
+}
+
+fn piece_kind_to_nnue(kind: PieceKind) -> Option<NnuePiece> {
+    match kind {
+        PieceKind::Pawn => Some(NnuePiece::Pawn),
+        PieceKind::Knight => Some(NnuePiece::Knight),
+        PieceKind::Bishop => Some(NnuePiece::Bishop),
+        PieceKind::Rook => Some(NnuePiece::Rook),
+        PieceKind::Queen => Some(NnuePiece::Queen),
+        PieceKind::King => None,
+    }
+}
+
+fn side_to_nnue(side: Side) -> NnueColor {
+    match side {
+        Side::White => NnueColor::White,
+        Side::Black => NnueColor::Black,
+    }
+}
+
+fn square_to_nnue(sq: u8) -> NnueSquare {
+    NnueSquare::from_index(sq as usize)
 }
