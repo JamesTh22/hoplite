@@ -17,6 +17,22 @@ use std::time::{Duration, Instant};
 
 const MAX_PLY: usize = 128;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GamePhase {
+    Opening,
+    Middlegame,
+    Endgame,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PositionProfile {
+    phase: GamePhase,
+    mobility: usize,
+    capture_targets: usize,
+    checking_moves: usize,
+    in_check: bool,
+}
+
 #[derive(Debug)]
 pub enum SearchError {
     MissingEvaluator,
@@ -79,6 +95,8 @@ pub struct Search {
     pub killers: [[Move; 2]; MAX_PLY], // two killer moves per ply
     pub history: [[i32; 4096]; 2],     // side, from*64+to
     pub evaluator: Arc<dyn Evaluator + Send + Sync>,
+    evaluator_name: String,
+    evaluator_details: Option<String>,
     pub min_depth: i32,
     current_iter_depth: i32,
 }
@@ -96,6 +114,7 @@ impl Search {
 
     pub fn new(nnue: Option<Arc<NnueNetwork>>) -> Result<Self, SearchError> {
         let network = nnue.ok_or(SearchError::MissingEvaluator)?;
+        let summary = network.summary();
         Ok(Self {
             nodes: 0,
             tt: Arc::new(Mutex::new(TT::new(256))),
@@ -112,7 +131,9 @@ impl Search {
             multipv: 1,
             killers: [[Move::default(); 2]; MAX_PLY],
             history: [[0; 4096]; 2],
-            evaluator: nnue_evaluator(network),
+            evaluator: nnue_evaluator(Arc::clone(&network)),
+            evaluator_name: "NNUE".to_string(),
+            evaluator_details: Some(summary),
             min_depth: 20,
             current_iter_depth: 0,
         })
@@ -130,6 +151,19 @@ impl Search {
 
     pub fn set_evaluator(&mut self, evaluator: Arc<dyn Evaluator>) {
         self.evaluator = evaluator;
+        self.evaluator_name = "Custom".to_string();
+        self.evaluator_details = None;
+    }
+
+    pub fn install_nnue(&mut self, network: Arc<NnueNetwork>) {
+        let summary = network.summary();
+        self.evaluator = nnue_evaluator(network);
+        self.evaluator_name = "NNUE".to_string();
+        self.evaluator_details = Some(summary);
+    }
+
+    pub fn evaluator_status(&self) -> (&str, Option<&str>) {
+        (&self.evaluator_name, self.evaluator_details.as_deref())
     }
 
     pub fn set_min_depth(&mut self, depth: i32) {
@@ -180,11 +214,15 @@ impl Search {
         let mut stable_count = 0; // Track how many times the best move remains stable
         let start = Instant::now();
 
+        let profile = Self::profile_position(b);
+        let dynamic_min_depth = self.dynamic_min_depth(&profile).min(depth.max(1));
+        let stability_limit = self.stability_requirement(&profile);
+
         self.current_iter_depth = 0;
         self.min_depth_satisfied = false;
         for d in 1..=depth {
             self.current_iter_depth = d;
-            if !self.min_depth_satisfied && d >= self.min_depth {
+            if !self.min_depth_satisfied && d >= dynamic_min_depth {
                 self.min_depth_satisfied = true;
             }
             let pvs = self.search_root(
@@ -205,8 +243,8 @@ impl Search {
             if d > 1 {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
-                    // If move is stable for 2 iterations and we're past depth 6, return early
-                    if stable_count >= 2 && d >= 6 && d >= self.min_depth {
+                    // If move is stable for several iterations and we're past depth 6, return early
+                    if stable_count >= stability_limit && d >= 6 && d >= dynamic_min_depth {
                         break;
                     }
                 } else {
@@ -254,68 +292,33 @@ impl Search {
 
     // Time-limited
     // Dynamic time management based on position complexity and game phase
-    fn allocate_time(&self, total_time_ms: u128, b: &mut Board) -> u128 {
-        // Count material to estimate game phase (0-256)
-        let mut phase = 0;
-        let mut total_pieces = 0;
-        for i in 0..64u8 {
-            if let Some(pc) = b.piece_at(i) {
-                total_pieces += 1;
-                match pc.kind {
-                    PieceKind::Pawn => phase += 0,
-                    PieceKind::Knight | PieceKind::Bishop => phase += 8,
-                    PieceKind::Rook => phase += 16,
-                    PieceKind::Queen => phase += 32,
-                    PieceKind::King => phase += 0,
-                }
-            }
-        }
-        phase = phase.min(256);
-
-        // Estimate position complexity (0-100)
-        let mut complexity = 0;
-
-        // More pieces = more complex
-        complexity += (total_pieces * 2).min(30);
-
-        // Check for tactical elements
-        let moves = legal_moves(b);
-        for mv in moves.iter() {
-            if b.piece_at(mv.to).is_some() {
-                // Captures available
-                complexity += 5;
-            }
-            let u = b.make_move(*mv);
-            if b.in_check(b.stm) {
-                // Checks available
-                complexity += 10;
-            }
-            b.unmake_move(*mv, u);
+    fn allocate_time(&self, total_time_ms: u128, profile: &PositionProfile) -> u128 {
+        if total_time_ms == 0 {
+            return 0;
         }
 
-        // Kings under attack need more time
-        if square_attacked(b, king_square(b, b.stm), b.stm.flip()) {
-            complexity += 20;
+        let mut factor: u128 = match profile.phase {
+            GamePhase::Opening => 105,
+            GamePhase::Middlegame => 120,
+            GamePhase::Endgame => 95,
+        };
+
+        if profile.in_check {
+            factor += 15;
         }
 
-        complexity = complexity.min(100);
+        let tactical = profile.capture_targets + profile.checking_moves;
+        factor += (tactical.min(8) as u128) * 5;
+        factor += (profile.mobility.min(40) as u128) / 2;
 
-        // Adjust time based on phase and complexity
-        let mut allocated = total_time_ms;
-
-        // Use more time in complex middlegame positions
-        if phase > 64 && phase < 192 {
-            allocated = allocated * (100 + complexity as u128) / 100;
+        let mut allocated = total_time_ms.saturating_mul(factor).saturating_div(100);
+        let min_alloc = (total_time_ms / 4).max(20);
+        let max_alloc = total_time_ms.saturating_mul(2).max(min_alloc);
+        if allocated < min_alloc {
+            allocated = min_alloc;
+        } else if allocated > max_alloc {
+            allocated = max_alloc;
         }
-
-        // Use less time in simple endgames
-        if phase <= 64 {
-            allocated = allocated * 70 / 100;
-        }
-
-        // Ensure reasonable bounds
-        allocated = allocated.clamp(total_time_ms / 10, total_time_ms * 2);
-
         allocated
     }
 
@@ -325,8 +328,12 @@ impl Search {
         self.nodes = 0;
         self.stop.store(false, Ordering::Relaxed);
 
+        let profile = Self::profile_position(b);
+        let dynamic_min_depth = self.dynamic_min_depth(&profile);
+        let stability_limit = self.stability_requirement(&profile);
+
         // Get dynamically allocated time based on position
-        let allocated_time = self.allocate_time(time_ms, b);
+        let allocated_time = self.allocate_time(time_ms, &profile);
         self.deadline = Some(Instant::now() + Duration::from_millis(allocated_time as u64));
 
         let mut best = Move::default();
@@ -338,7 +345,7 @@ impl Search {
         self.min_depth_satisfied = false;
         for d in 1..=64 {
             self.current_iter_depth = d;
-            if !self.min_depth_satisfied && d >= self.min_depth {
+            if !self.min_depth_satisfied && d >= dynamic_min_depth {
                 self.min_depth_satisfied = true;
             }
             let pvs = self.search_root(
@@ -359,8 +366,8 @@ impl Search {
             if d > 1 {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
-                    // If move is stable for 2 iterations and we're past depth 6, return early
-                    if stable_count >= 2 && d >= 6 && d >= self.min_depth {
+                    let depth_limit = dynamic_min_depth.max(6);
+                    if stable_count >= stability_limit && d >= depth_limit {
                         break;
                     }
                 } else {
@@ -427,9 +434,13 @@ impl Search {
         let mut stable_count = 0; // Track stability
         let start = Instant::now();
 
+        let profile = Self::profile_position(b);
+        let dynamic_min_depth = self.dynamic_min_depth(&profile);
+        let stability_limit = self.stability_requirement(&profile);
+
         self.min_depth_satisfied = false;
         for d in 1..=64 {
-            if !self.min_depth_satisfied && d >= self.min_depth {
+            if !self.min_depth_satisfied && d >= dynamic_min_depth {
                 self.min_depth_satisfied = true;
             }
             let pvs = self.search_root(
@@ -450,8 +461,8 @@ impl Search {
             if d > 1 {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
-                    // If move is stable for 2 iterations and we're past depth 6, return early
-                    if stable_count >= 2 && d >= 6 {
+                    let depth_limit = dynamic_min_depth.max(6);
+                    if stable_count >= stability_limit && d >= depth_limit {
                         break;
                     }
                 } else {
@@ -1068,6 +1079,92 @@ impl Search {
             }
         }
         alpha
+    }
+
+    fn profile_position(board: &Board) -> PositionProfile {
+        let mut non_pawn_weight = 0;
+        for sq in 0..64u8 {
+            if let Some(pc) = board.piece_at(sq) {
+                non_pawn_weight += match pc.kind {
+                    PieceKind::Pawn | PieceKind::King => 0,
+                    PieceKind::Knight | PieceKind::Bishop => 1,
+                    PieceKind::Rook => 2,
+                    PieceKind::Queen => 4,
+                };
+            }
+        }
+
+        let phase = if non_pawn_weight >= 16 {
+            GamePhase::Opening
+        } else if non_pawn_weight >= 6 {
+            GamePhase::Middlegame
+        } else {
+            GamePhase::Endgame
+        };
+
+        let moves = legal_moves(board);
+        let mobility = moves.len();
+        let mut capture_targets = 0usize;
+        let mut checking_moves = 0usize;
+        for mv in &moves {
+            if board.piece_at(mv.to).is_some()
+                || (board.ep == Some(mv.to)
+                    && matches!(board.piece_at(mv.from), Some(p) if matches!(p.kind, PieceKind::Pawn)))
+            {
+                capture_targets += 1;
+            }
+
+            if checking_moves < 16 {
+                let mut clone = board.clone();
+                clone.make_move(*mv);
+                if clone.in_check(clone.stm) {
+                    checking_moves += 1;
+                }
+            }
+        }
+
+        PositionProfile {
+            phase,
+            mobility,
+            capture_targets,
+            checking_moves,
+            in_check: board.in_check(board.stm),
+        }
+    }
+
+    fn dynamic_min_depth(&self, profile: &PositionProfile) -> i32 {
+        let mut depth = self.min_depth.max(4);
+        match profile.phase {
+            GamePhase::Opening => {
+                depth = depth.max(6);
+            }
+            GamePhase::Middlegame => {
+                depth = depth.saturating_add(2);
+                if profile.capture_targets + profile.checking_moves >= 3 {
+                    depth = depth.saturating_add(1);
+                }
+            }
+            GamePhase::Endgame => {
+                depth = depth.max(10);
+            }
+        }
+        depth.min(64)
+    }
+
+    fn stability_requirement(&self, profile: &PositionProfile) -> usize {
+        let mut requirement = if matches!(profile.phase, GamePhase::Middlegame) {
+            3
+        } else {
+            2
+        };
+
+        if profile.capture_targets + profile.checking_moves >= 4 {
+            requirement += 1;
+        } else if profile.mobility <= 18 && matches!(profile.phase, GamePhase::Endgame) {
+            requirement = requirement.max(2);
+        }
+
+        requirement
     }
 
     fn score_moves(
