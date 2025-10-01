@@ -408,10 +408,6 @@ impl Evaluator for PsqtEvaluator {
     fn pop_state(&self, _ctx: &mut EvalState) {}
 }
 
-pub fn default_evaluator() -> Arc<dyn Evaluator> {
-    Arc::new(PsqtEvaluator)
-}
-
 pub fn nnue_evaluator(network: Arc<NnueNetwork>) -> Arc<dyn Evaluator> {
     Arc::new(NnueEvaluator::new(network))
 }
