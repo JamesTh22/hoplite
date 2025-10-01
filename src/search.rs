@@ -53,6 +53,7 @@ pub struct Search {
     pub stop: Arc<AtomicBool>,
     pub threads: usize,
     pub deadline: Option<Instant>,
+    pub min_depth_satisfied: bool,
 
     // Multi-PV
     pub multipv: usize,
@@ -83,6 +84,7 @@ impl Search {
             stop: Arc::new(AtomicBool::new(false)),
             threads: 1,
             deadline: None,
+            min_depth_satisfied: false,
             pawn_tt: HashMap::with_capacity(1 << 16),
             exp_table: HashMap::with_capacity(1 << 14),
             exp_enabled: false,
@@ -119,7 +121,7 @@ impl Search {
     #[inline]
     fn time_up(&self) -> bool {
         if let Some(d) = self.deadline {
-            Instant::now() >= d && self.current_iter_depth >= self.min_depth
+            Instant::now() >= d
         } else {
             false
         }
@@ -161,8 +163,12 @@ impl Search {
         let start = Instant::now();
 
         self.current_iter_depth = 0;
+        self.min_depth_satisfied = false;
         for d in 1..=depth {
             self.current_iter_depth = d;
+            if !self.min_depth_satisfied && d >= self.min_depth {
+                self.min_depth_satisfied = true;
+            }
             let pvs = self.search_root(
                 b,
                 d,
@@ -224,6 +230,7 @@ impl Search {
             }
         }
         self.current_iter_depth = 0;
+        self.min_depth_satisfied = false;
         best
     }
 
@@ -310,8 +317,12 @@ impl Search {
         let start = Instant::now();
 
         self.current_iter_depth = 0;
+        self.min_depth_satisfied = false;
         for d in 1..=64 {
             self.current_iter_depth = d;
+            if !self.min_depth_satisfied && d >= self.min_depth {
+                self.min_depth_satisfied = true;
+            }
             let pvs = self.search_root(
                 b,
                 d,
@@ -369,8 +380,10 @@ impl Search {
             }
             let _ = io::stdout().flush();
             if self.time_up() {
-                self.stop.store(true, Ordering::Relaxed);
-                break;
+                if self.min_depth_satisfied {
+                    self.stop.store(true, Ordering::Relaxed);
+                    break;
+                }
             }
         }
         if let Some(deadline) = self.deadline {
@@ -380,6 +393,7 @@ impl Search {
             }
         }
         self.current_iter_depth = 0;
+        self.min_depth_satisfied = false;
         best
     }
 
@@ -395,7 +409,11 @@ impl Search {
         let mut stable_count = 0; // Track stability
         let start = Instant::now();
 
+        self.min_depth_satisfied = false;
         for d in 1..=64 {
+            if !self.min_depth_satisfied && d >= self.min_depth {
+                self.min_depth_satisfied = true;
+            }
             let pvs = self.search_root(
                 b,
                 d,
@@ -456,6 +474,7 @@ impl Search {
                 break;
             }
         }
+        self.min_depth_satisfied = false;
         best
     }
 
@@ -526,7 +545,7 @@ impl Search {
             let mut results: Vec<(Move, i16)> =
                 results.into_iter().map(|(m, s, _)| (m, s)).collect();
             results.sort_by_key(|(_, s)| -*s);
-            if self.time_up() {
+            if self.time_up() && self.min_depth_satisfied {
                 self.stop.store(true, Ordering::Relaxed);
             }
             let mut pvs = Vec::new();
@@ -550,7 +569,9 @@ impl Search {
             results.clear();
             for (_, mv) in scored.clone() {
                 if self.time_up() {
-                    self.stop.store(true, Ordering::Relaxed);
+                    if self.min_depth_satisfied {
+                        self.stop.store(true, Ordering::Relaxed);
+                    }
                     break;
                 }
                 let u = b.make_move(mv);
@@ -646,9 +667,20 @@ impl Search {
         history_keys: &mut Vec<u64>,
         eval_state: &mut EvalState,
     ) -> i16 {
+        if self.stop.load(Ordering::Relaxed) {
+            return alpha;
+        }
+        if self.time_up() {
+            if self.min_depth_satisfied {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+            return alpha;
+        }
         self.nodes += 1;
         if (self.nodes & 0x1FFF) == 0 && self.time_up() {
-            self.stop.store(true, Ordering::Relaxed);
+            if self.min_depth_satisfied {
+                self.stop.store(true, Ordering::Relaxed);
+            }
             return alpha;
         }
         if is_draw(history_keys, b.key, b.halfmove) {
@@ -908,9 +940,20 @@ impl Search {
         history_keys: &mut Vec<u64>,
         eval_state: &mut EvalState,
     ) -> i16 {
+        if self.stop.load(Ordering::Relaxed) {
+            return alpha;
+        }
+        if self.time_up() {
+            if self.min_depth_satisfied {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+            return alpha;
+        }
         self.nodes += 1;
         if (self.nodes & 0x1FFF) == 0 && self.time_up() {
-            self.stop.store(true, Ordering::Relaxed);
+            if self.min_depth_satisfied {
+                self.stop.store(true, Ordering::Relaxed);
+            }
             return alpha;
         }
         if is_draw(history_keys, b.key, b.halfmove) {
