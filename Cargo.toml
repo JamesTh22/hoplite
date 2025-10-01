@@ -14,6 +14,7 @@ opt-level = 3
 
 [dependencies]
 anyhow = "1"
+binread = "2"
 thiserror = "1"
 parking_lot = "0.12"
 rand = "0.8"
@@ -23,6 +24,7 @@ serde_json = "1"
 lazy_static = "1"
 num_cpus = "1"
 indicatif = { version = "0.17", features = ["rayon"] }
+nnue = { git = "https://github.com/analog-hors/nnue-rs", rev = "004eb4dd05cfd8e6e3d39426f6e39a64878cfd22" }
 
 [dev-dependencies]
 criterion = "0.5"
