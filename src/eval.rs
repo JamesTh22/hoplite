@@ -418,15 +418,11 @@ pub fn nnue_evaluator(network: Arc<NnueNetwork>) -> Arc<dyn Evaluator> {
 
 pub struct NnueEvaluator {
     network: Arc<NnueNetwork>,
-    fallback: PsqtEvaluator,
 }
 
 impl NnueEvaluator {
     pub fn new(network: Arc<NnueNetwork>) -> Self {
-        Self {
-            network,
-            fallback: PsqtEvaluator,
-        }
+        Self { network }
     }
 }
 
@@ -447,13 +443,14 @@ impl Evaluator for NnueEvaluator {
                 stack.push(Accumulator::from_board(b));
             }
             if let Some(acc) = stack.last_mut() {
-                if let Some(score) = self.network.evaluate(b, acc) {
-                    return score;
-                }
+                return self
+                    .network
+                    .evaluate(b, acc)
+                    .expect("NNUE evaluation failed");
             }
         }
 
-        self.fallback.eval(b, ctx)
+        panic!("NNUE accumulator stack missing");
     }
 
     fn push_state(&self, b: &Board, ctx: &mut EvalState, mv: Move, undo: &Undo) {
