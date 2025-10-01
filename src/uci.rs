@@ -58,13 +58,22 @@ pub struct Uci {
     search_config: SearchConfig,
 }
 
+fn resolve_default_eval_dir(exe_path: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = exe_path {
+        if let Some(parent) = path.parent() {
+            return parent.join("NNUE");
+        }
+    }
+    PathBuf::from("NNUE")
+}
+
 impl Uci {
     pub fn new() -> Self {
         Self {
             board: Board::new_start(),
             search: None,
             search_thread: None,
-            eval_dir: PathBuf::from("NNUE"),
+            eval_dir: resolve_default_eval_dir(std::env::current_exe().ok()),
             auto_load_attempted: false,
             search_config: SearchConfig::new(),
         }
@@ -124,6 +133,11 @@ impl Uci {
         } else {
             self.eval_dir.join(candidate)
         }
+    }
+
+    #[cfg(test)]
+    fn eval_dir(&self) -> &Path {
+        &self.eval_dir
     }
 
     fn apply_config_to(&self, search: &mut Search) {
@@ -776,6 +790,63 @@ impl Uci {
         {
             let _u = self.board.make_move(mv);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn default_eval_dir_uses_executable_directory() {
+        let exe = std::env::current_exe().ok();
+        let resolved = resolve_default_eval_dir(exe.clone());
+        if let Some(path) = exe {
+            if let Some(parent) = path.parent() {
+                assert_eq!(resolved, parent.join("NNUE"));
+                return;
+            }
+        }
+        assert_eq!(resolved, PathBuf::from("NNUE"));
+    }
+
+    #[test]
+    fn default_eval_dir_falls_back_when_missing() {
+        let resolved = resolve_default_eval_dir(None);
+        assert_eq!(resolved, PathBuf::from("NNUE"));
+    }
+
+    #[test]
+    fn nnue_files_found_from_parent_directory() {
+        let exe = std::env::current_exe().expect("current exe path");
+        let exe_dir = exe.parent().expect("exe dir").to_path_buf();
+        let nnue_dir = exe_dir.join("NNUE");
+        fs::create_dir_all(&nnue_dir).expect("create NNUE dir");
+
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let nnue_path = nnue_dir.join(format!("hoplite_test_{unique_suffix}.nnue"));
+        fs::write(&nnue_path, b"").expect("create nnue file");
+
+        let original_dir = std::env::current_dir().expect("current dir");
+        let parent_dir = exe_dir.parent().unwrap_or(&exe_dir);
+        std::env::set_current_dir(parent_dir).expect("set parent dir");
+
+        let uci = Uci::new();
+        assert!(uci.eval_dir().is_absolute());
+        assert_eq!(uci.eval_dir(), &nnue_dir);
+
+        let mut files = uci.nnue_files().expect("list nnue files");
+        files.retain(|p| p == &nnue_path);
+        assert_eq!(files, vec![nnue_path.clone()]);
+
+        std::env::set_current_dir(&original_dir).expect("restore dir");
+        fs::remove_file(&nnue_path).expect("cleanup nnue file");
     }
 }
 
