@@ -1,5 +1,4 @@
 use crate::board::Board;
-use crate::eval::nnue_evaluator;
 use crate::nnue;
 use crate::search::Search;
 use crate::types::Move;
@@ -133,7 +132,7 @@ impl Uci {
 
     fn install_network(&mut self, network: Arc<nnue::NnueNetwork>) -> Result<(), String> {
         if let Some(search) = self.search.as_mut() {
-            search.set_evaluator(nnue_evaluator(Arc::clone(&network)));
+            search.install_nnue(Arc::clone(&network));
             Ok(())
         } else {
             let mut search = Search::new(Some(network)).map_err(|e| e.to_string())?;
@@ -497,6 +496,21 @@ impl Uci {
         } else if line == "d" {
             let fen = self.board.to_fen();
             writeln!(out, "info string FEN {}", fen).unwrap();
+        } else if line.eq_ignore_ascii_case("evalinfo") {
+            if let Some(search) = self.search.as_ref() {
+                let (name, details) = search.evaluator_status();
+                if let Some(details) = details {
+                    writeln!(out, "info string evaluator {} {}", name, details).unwrap();
+                } else {
+                    writeln!(out, "info string evaluator {}", name).unwrap();
+                }
+            } else {
+                writeln!(
+                    out,
+                    "info string evaluator none loaded (use setoption EvalFile)"
+                )
+                .unwrap();
+            }
         } else if line.starts_with("perft") {
             let depth = line
                 .split_whitespace()
