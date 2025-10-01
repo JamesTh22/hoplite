@@ -1,11 +1,13 @@
 use crate::board::Board;
-use crate::eval::{default_evaluator, EvalState, Evaluator};
+use crate::eval::{nnue_evaluator, EvalState, Evaluator};
 use crate::movegen::{legal_moves, square_attacked};
+use crate::nnue::NnueNetwork;
 use crate::tt::{Bound, Entry, TT};
 use crate::types::{Move, PieceKind, Side};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -14,6 +16,21 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const MAX_PLY: usize = 128;
+
+#[derive(Debug)]
+pub enum SearchError {
+    MissingEvaluator,
+}
+
+impl fmt::Display for SearchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SearchError::MissingEvaluator => write!(f, "missing NNUE evaluator"),
+        }
+    }
+}
+
+impl std::error::Error for SearchError {}
 #[inline]
 #[allow(dead_code)]
 fn pack_move16(m: Move) -> u16 {
@@ -77,8 +94,9 @@ impl Search {
         xor.count_ones() > 2
     }
 
-    pub fn new() -> Self {
-        Self {
+    pub fn new(nnue: Option<Arc<NnueNetwork>>) -> Result<Self, SearchError> {
+        let network = nnue.ok_or(SearchError::MissingEvaluator)?;
+        Ok(Self {
             nodes: 0,
             tt: Arc::new(Mutex::new(TT::new(256))),
             stop: Arc::new(AtomicBool::new(false)),
@@ -94,10 +112,10 @@ impl Search {
             multipv: 1,
             killers: [[Move::default(); 2]; MAX_PLY],
             history: [[0; 4096]; 2],
-            evaluator: default_evaluator(),
+            evaluator: nnue_evaluator(network),
             min_depth: 20,
             current_iter_depth: 0,
-        }
+        })
     }
     pub fn set_hash_mb(&mut self, mb: usize) {
         *self.tt.lock() = TT::new(mb);
