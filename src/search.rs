@@ -367,7 +367,10 @@ impl Search {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
                     let depth_limit = dynamic_min_depth.max(6);
-                    if stable_count >= stability_limit && d >= depth_limit {
+                    if allow_stability_cutoff
+                        && stable_count >= stability_limit
+                        && d >= depth_limit
+                    {
                         break;
                     }
                 } else {
@@ -429,6 +432,7 @@ impl Search {
         self.nodes = 0;
         self.stop.store(false, Ordering::Relaxed);
         self.deadline = None;
+        let allow_stability_cutoff = self.deadline.is_some();
         let mut best = Move::default();
         let mut last_score: i16 = 0;
         let mut stable_count = 0; // Track stability
@@ -462,7 +466,10 @@ impl Search {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
                     let depth_limit = dynamic_min_depth.max(6);
-                    if stable_count >= stability_limit && d >= depth_limit {
+                    if allow_stability_cutoff
+                        && stable_count >= stability_limit
+                        && d >= depth_limit
+                    {
                         break;
                     }
                 } else {
