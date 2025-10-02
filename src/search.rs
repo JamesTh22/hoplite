@@ -336,6 +336,8 @@ impl Search {
         let allocated_time = self.allocate_time(time_ms, &profile);
         self.deadline = Some(Instant::now() + Duration::from_millis(allocated_time as u64));
 
+        let allow_stability_cutoff = self.deadline.is_some();
+
         let mut best = Move::default();
         let mut last_score: i16 = 0;
         let mut stable_count = 0; // Track stability
