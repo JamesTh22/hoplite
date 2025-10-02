@@ -48,13 +48,6 @@ impl fmt::Display for SearchError {
 
 impl std::error::Error for SearchError {}
 #[inline]
-#[allow(dead_code)]
-fn pack_move16(m: Move) -> u16 {
-    ((m.from as u16) << 6)
-        | (m.to as u16)
-        | ((m.promo.unwrap_or(crate::types::PieceKind::Pawn) as u16) << 12)
-}
-#[inline]
 fn is_draw(history: &[u64], key: u64, halfmove: u32) -> bool {
     if halfmove >= 100 {
         return true;
@@ -73,12 +66,6 @@ fn is_draw(history: &[u64], key: u64, halfmove: u32) -> bool {
 
 #[derive(Clone)]
 pub struct Search {
-    // Learning & caches
-    pub exp_table: HashMap<u128, (u32, u32)>, // key: (zobrist<<16)|move16 -> (plays,wins)
-    pub exp_enabled: bool,
-    pub exp_strength: i32, // 0..100
-    pub exp_path: Option<String>,
-
     pub pawn_tt: HashMap<u64, i32>,
     pub move_overhead_ms: u64,
     pub nodes: u64,
@@ -123,10 +110,6 @@ impl Search {
             deadline: None,
             min_depth_satisfied: false,
             pawn_tt: HashMap::with_capacity(1 << 16),
-            exp_table: HashMap::with_capacity(1 << 14),
-            exp_enabled: false,
-            exp_strength: 40,
-            exp_path: None,
             move_overhead_ms: 15,
             multipv: 1,
             killers: [[Move::default(); 2]; MAX_PLY],
@@ -369,9 +352,7 @@ impl Search {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
                     let depth_limit = dynamic_min_depth.max(6);
-                    if allow_stability_cutoff
-                        && stable_count >= stability_limit
-                        && d >= depth_limit
+                    if allow_stability_cutoff && stable_count >= stability_limit && d >= depth_limit
                     {
                         break;
                     }
@@ -468,9 +449,7 @@ impl Search {
                 if new_best.from == best.from && new_best.to == best.to {
                     stable_count += 1;
                     let depth_limit = dynamic_min_depth.max(6);
-                    if allow_stability_cutoff
-                        && stable_count >= stability_limit
-                        && d >= depth_limit
+                    if allow_stability_cutoff && stable_count >= stability_limit && d >= depth_limit
                     {
                         break;
                     }

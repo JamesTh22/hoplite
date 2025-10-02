@@ -2,7 +2,6 @@ use crate::board::Board;
 use crate::nnue;
 use crate::search::Search;
 use crate::types::Move;
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -14,10 +13,6 @@ struct SearchConfig {
     threads: usize,
     multipv: usize,
     move_overhead_ms: u64,
-    exp_enabled: bool,
-    exp_strength: i32,
-    exp_path: Option<String>,
-    exp_table: HashMap<u128, (u32, u32)>,
     min_depth: i32,
 }
 
@@ -28,10 +23,6 @@ impl SearchConfig {
             threads: 1,
             multipv: 1,
             move_overhead_ms: 15,
-            exp_enabled: false,
-            exp_strength: 40,
-            exp_path: None,
-            exp_table: HashMap::new(),
             min_depth: 20,
         }
     }
@@ -41,10 +32,6 @@ impl SearchConfig {
         search.set_threads(self.threads);
         search.multipv = self.multipv;
         search.move_overhead_ms = self.move_overhead_ms;
-        search.exp_enabled = self.exp_enabled;
-        search.exp_strength = self.exp_strength;
-        search.exp_path = self.exp_path.clone();
-        search.exp_table = self.exp_table.clone();
         search.set_min_depth(self.min_depth);
     }
 }
@@ -258,13 +245,6 @@ impl Uci {
             )
             .unwrap();
             writeln!(out, "option name MultiPV type spin default 1 min 1 max 10").unwrap();
-            writeln!(out, "option name LearnEnable type check default false").unwrap();
-            writeln!(
-                out,
-                "option name LearnStrength type spin default 40 min 0 max 100"
-            )
-            .unwrap();
-            writeln!(out, "option name LearnFile type string default hoplite.exp").unwrap();
             writeln!(
                 out,
                 "option name ParamsFile type string default params.json"
@@ -357,32 +337,6 @@ impl Uci {
                 if let Ok(ms) = val.trim().parse::<u64>() {
                     self.search_config.move_overhead_ms = ms;
                     self.with_search_mut(|s| s.move_overhead_ms = ms);
-                }
-            } else if name.eq_ignore_ascii_case("LearnEnable") {
-                let v = val.trim().eq_ignore_ascii_case("true") || val.trim() == "1";
-                self.search_config.exp_enabled = v;
-                self.with_search_mut(|s| s.exp_enabled = v);
-            } else if name.eq_ignore_ascii_case("LearnStrength") {
-                if let Ok(s) = val.trim().parse::<i32>() {
-                    let strength = s.clamp(0, 100);
-                    self.search_config.exp_strength = strength;
-                    self.with_search_mut(|search| search.exp_strength = strength);
-                }
-            } else if name.eq_ignore_ascii_case("LearnFile") {
-                if !val.trim().is_empty() {
-                    let path = val.trim().to_string();
-                    if let Ok(s) = std::fs::read_to_string(&path) {
-                        let map: HashMap<u128, (u32, u32)> =
-                            serde_json::from_str(&s).unwrap_or_default();
-                        self.search_config.exp_path = Some(path.clone());
-                        self.search_config.exp_table = map.clone();
-                        let path_clone = path.clone();
-                        let map_clone = map.clone();
-                        self.with_search_mut(move |search| {
-                            search.exp_path = Some(path_clone.clone());
-                            search.exp_table = map_clone.clone();
-                        });
-                    }
                 }
             } else if name.eq_ignore_ascii_case("EvalFile") {
                 let trimmed = val.trim();
